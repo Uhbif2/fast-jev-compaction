@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { compact, compactionCandidates, truncatedResultText } from '../src/compact.js';
-import { collectToolCalls, estimateTokens, fitBatchStates, hasSideEffects } from '../src/state.js';
+import { collectToolCalls, estimateTokens, fitBatchStates, hasSideEffects, isCompactedResult } from '../src/state.js';
 import { noulAnswer, parseJevResponse } from '../src/request.js';
 import { jevAsker } from '../hooks/fast-jev.js';
 import type { CompactionState, JevAsker, Message } from '../src/types.js';
@@ -94,6 +94,15 @@ describe('long dialogue coverage', () => {
 });
 
 describe('useful candidates and action records', () => {
+  it('does not mistake plugin source code or another call\'s note for a shortened result', () => {
+    expect(isCompactedResult("const marker = '[fast-jev-compaction ';", 'u')).toBe(false);
+    expect(isCompactedResult('[fast-jev-compaction truncated ${cut} of ${total} chars of this Read result]', 'u')).toBe(false);
+    const note = truncatedResultText('x'.repeat(4000), false, 300, { tool: 'Read', tool_use_id: 'other', sideEffects: false });
+    expect(isCompactedResult(note, 'u')).toBe(false);
+    expect(isCompactedResult(note, 'other')).toBe(true);
+    expect(isCompactedResult('head\n[fast-jev-compaction truncated 1234 chars of this tool result; re-run the tool if needed]', 'u')).toBe(true);
+  });
+
   it('bounds a pass by complete shard groups and advances past earlier kept candidates', async () => {
     const messages: Message[] = [text('user', 'Keep investigating.')];
     for (let i = 0; i < 12; i++) {
