@@ -111,6 +111,23 @@ describe('session message mapping', () => {
 });
 
 describe('compactSession', () => {
+  it('compacts an inline-only tool outcome when Claude supplies no toolResults entry', async () => {
+    const output = 'HEAD\n' + 'old shell output '.repeat(900) + '\nTAIL';
+    const messages: SessionMessage[] = [
+      message('user', 'Continue.', { handle: 'h-inline-0' }),
+      call('inline-bash', 'Bash', { command: 'npm test' }, output),
+      message('user', 'The shell output is historical now.', { handle: 'h-inline-2' }),
+    ];
+    const config = { ...resolveHookConfig({ preserveRecentMessages: 0, compactAssistantText: false }), apiKey: 'k' };
+    const { result: compacted, messages: after } = await compactSession(messages, config, jevFetch(() => 0.1));
+
+    expect(compacted.decisions[0]?.action).toBe('drop_result');
+    expect(compacted.stats.charsAfter).toBeLessThan(compacted.stats.charsBefore);
+    expect(after[1]?.handle).toBeUndefined();
+    expect(after[1]?.toolUses[0]?.text).toContain('[fast-jev-compaction truncated ');
+    expect(after[1]?.toolUses[0]?.text?.length).toBeLessThan(output.length);
+  });
+
   it('runs the library over the engine fetch and reports the outcome', async () => {
     const bodies: string[] = [];
     const config = { ...resolveHookConfig({ preserveRecentMessages: 1, compactAssistantText: false }), apiKey: 'k', model: 'jev-x' };

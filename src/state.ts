@@ -145,7 +145,17 @@ export function collectToolCalls(
   const calls: ToolCall[] = [];
   messages.forEach((message, callIndex) => {
     for (const tool of message.toolUses) {
-      const found = results.get(tool.tool_use_id);
+      const explicit = results.get(tool.tool_use_id);
+      const found = explicit ?? (tool.text !== undefined
+        ? {
+            index: callIndex,
+            result: {
+              tool_use_id: tool.tool_use_id,
+              text: tool.text,
+              isError: tool.isError ?? false,
+            },
+          }
+        : undefined);
       if (!found) continue;
       calls.push({
         id: `t${calls.length + 1}`,

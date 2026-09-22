@@ -593,7 +593,7 @@ export function applyDecisions(
   return kept;
 }
 
-/** Characters of text, tool input and tool output a message holds. */
+/** Characters of text, tool input and explicit tool output a message holds. */
 export function messageChars(message: Message): number {
   let total = message.text.length;
   for (const tool of message.toolUses) {
@@ -604,6 +604,27 @@ export function messageChars(message: Message): number {
     }
   }
   for (const result of message.toolResults ?? []) total += result.text.length;
+  return total;
+}
+
+/**
+ * Characters represented by a whole transcript. Claude Code may expose a
+ * completed tool result twice (toolUse.text and a later toolResults entry) or
+ * only inline on toolUse.text. Count the inline copy only when no explicit
+ * tool_result exists anywhere in the transcript.
+ */
+export function transcriptChars(messages: readonly Message[]): number {
+  const explicitResultIds = new Set(
+    messages.flatMap((message) => message.toolResults ?? []).map((result) => result.tool_use_id),
+  );
+  let total = messages.reduce((sum, message) => sum + messageChars(message), 0);
+  for (const message of messages) {
+    for (const tool of message.toolUses) {
+      if (!explicitResultIds.has(tool.tool_use_id) && tool.text !== undefined) {
+        total += tool.text.length;
+      }
+    }
+  }
   return total;
 }
 
@@ -644,7 +665,7 @@ export async function compact(
     ? assistantTextCandidateIndices(messages, resolved.preserveRecentMessages)
     : [];
   const assistantCandidateSet = new Set(assistantCandidates);
-  const charsBefore = messages.reduce((sum, message) => sum + messageChars(message), 0);
+  const charsBefore = transcriptChars(messages);
 
   const stages = new Set<string>();
   let maxStateTokens = 0;
@@ -812,7 +833,7 @@ export async function compact(
       messagesBefore: messages.length,
       messagesAfter: kept.length,
       charsBefore,
-      charsAfter: kept.reduce((sum, message) => sum + messageChars(message), 0),
+      charsAfter: transcriptChars(kept),
       calls: calls.length,
       kept: count(decisions, 'kept'),
       resultsDropped: count(decisions, 'result_dropped'),
