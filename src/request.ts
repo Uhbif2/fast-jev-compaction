@@ -42,7 +42,8 @@ export function parseJevResponse(
   text: string,
 ): JevResponse {
   if (!ok) {
-    throw new Error(`Jev request failed (${status}): ${text.slice(0, 200)}`);
+    // Error bodies may echo state, result contents or credentials. Never log them.
+    throw new Error(`Jev request failed (HTTP ${status})`);
   }
   let parsed: unknown;
   try {
@@ -72,7 +73,7 @@ export function noulAnswer(
     !answer ||
     !('noul' in answer) ||
     typeof answer.noul !== 'number' ||
-    !Number.isFinite(answer.noul)
+    !Number.isFinite(answer.noul) || answer.noul < 0 || answer.noul > 1
   ) {
     throw new Error(`Invalid Jev answer for ${name}`);
   }

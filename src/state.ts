@@ -9,7 +9,7 @@ import type {
 } from './types.js';
 
 export const STATE_CONTEXT =
-  'A coding-assistant conversation is being compacted. This request is one evidence shard from the same conversation. `history` contains every user text message verbatim, a verbatim recent assistant anchor, and one verbatim historical assistant slice; `dialogue_index` maps the entire text dialogue so omitted assistant slices remain globally locatable; `tool_index`, when present, is a compact chronology of tool activity. Other shards evaluate the same targets against the other assistant slices. Each question asks whether one historical tool call or result contains information relevant to correctly continuing this same conversation from its latest point.';
+  'Judge relevance to continuing this conversation at its LATEST point, not relevance to the historical task when a call was made. History holds verbatim dialogue evidence; dialogue_index locates other text, tool_index locates calls. Other shards cover the remaining dialogue; removal requires low scores across ALL shards. Recent context and goal describe the current task; old requirements remain applicable unless superseded. A finished subtask can still supply needed evidence. Missing evidence is not proof of irrelevance.';
 
 /** Successive caps on the serialised tool input included per call. */
 const INPUT_CHARS = [1000, 200, 60] as const;
@@ -63,6 +63,64 @@ export function resultPreview(text: string, chars: number): string {
   return `${flat.slice(0, chars)} … ${flat.slice(-chars)}`;
 }
 
+/** The marker every fast-jev truncation note starts with. */
+export const COMPACTION_NOTE_MARKER = '[fast-jev-compaction ';
+
+const READ_ONLY_TOOLS = new Set([
+  'Read',
+  'Grep',
+  'Glob',
+  'LS',
+  'WebFetch',
+  'WebSearch',
+  'ToolSearch',
+  'TaskOutput',
+  'TaskList',
+  'TaskGet',
+  'ListMcpResourcesTool',
+  'ReadMcpResourceTool',
+  'ReadMcpResourceDirTool',
+  'NotebookRead',
+]);
+
+/**
+ * Whether a tool may have changed something outside the conversation. Only
+ * known lookups are read-only; Bash, PowerShell, edits, agents and every
+ * unknown tool count as side-effecting.
+ */
+export function hasSideEffects(tool: string): boolean {
+  // A name such as get_and_delete is not a read-only contract. Unknown MCP
+  // tools retain their action record just like shell commands and edits.
+  return !READ_ONLY_TOOLS.has(tool);
+}
+
+const FILE_WRITERS = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit']);
+
+function stringField(input: Record<string, unknown>, ...keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = input[key];
+    if (typeof value === 'string' && value.length > 0) return value;
+  }
+  return undefined;
+}
+
+/** What a call looks at, so a later call on the same target can be recognised. */
+function targetKey(tool: string, input: Record<string, unknown>): string | undefined {
+  const path = stringField(input, 'file_path', 'notebook_path', 'path');
+  // Different ranges of one file are not duplicate reads. Case is significant
+  // on some hosts, so exact input equality is the conservative signal.
+  if (tool === 'Read') return path ? `Read:${JSON.stringify(input)}` : undefined;
+  if (tool === 'Bash' || tool === 'PowerShell') {
+    const command = stringField(input, 'command');
+    return command ? `${tool}:${command.trim()}` : undefined;
+  }
+  try {
+    return `${tool}:${JSON.stringify(input)}`;
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Pairs every tool_use with its tool_result by `tool_use_id`. Calls without a
  * result are not candidates (there is nothing to drop yet).
@@ -98,9 +156,33 @@ export function collectToolCalls(
         pinned:
           isPinned(callIndex, messages.length, preserveRecentMessages) ||
           isPinned(found.index, messages.length, preserveRecentMessages),
+        sideEffects: hasSideEffects(tool.tool),
+        compacted: found.result.text.includes(COMPACTION_NOTE_MARKER),
       });
     }
   });
+
+  // Later calls on the same target: the newest wins, walking backwards.
+  const latestByTarget = new Map<string, string>();
+  const latestWriteByFile = new Map<string, string>();
+  for (let i = calls.length - 1; i >= 0; i -= 1) {
+    const call = calls[i]!;
+    const key = targetKey(call.tool, call.input);
+    if (key) {
+      const later = latestByTarget.get(key);
+      if (later) call.repeatedBy = later;
+      latestByTarget.set(key, call.id);
+    }
+    const path = stringField(call.input, 'file_path', 'notebook_path');
+    if (!path) continue;
+    const file = path;
+    if (call.tool === 'Read') {
+      const writer = latestWriteByFile.get(file);
+      if (writer) call.targetChangedBy = writer;
+    } else if (FILE_WRITERS.has(call.tool) && !call.isError) {
+      latestWriteByFile.set(file, call.id);
+    }
+  }
   return calls;
 }
 
@@ -439,6 +521,108 @@ type ShardGroup = {
 };
 
 /**
+ * Overflow path: cover BOTH roles, including oversized individual messages,
+ * verbatim across shards. Only the evidence sent to Jev is partitioned; the
+ * output conversation is never shortened here. Scores still merge with MAX.
+ * The common index and recent anchor are built once, not once per candidate.
+ */
+function fitDialogueShards(
+  messages: readonly Message[],
+  calls: readonly ToolCall[],
+  batch: readonly ToolCall[],
+  options: Pick<ResolvedCompactOptions, 'goal'>,
+  tokenLimit: number,
+): FittedState[] {
+  const dialogue = dialogueTexts(messages);
+  const state: CompactionState = {
+    context: STATE_CONTEXT,
+    goal: options.goal || goalFromMessages(messages),
+    history: [],
+    dialogue_index: dialogue.map((entry) => `${entry.i} ${entry.role === 'user' ? 'u' : 'a'} ${entry.text.length}ch: ${indexExcerpt(entry.text, 72)}`),
+    evaluating: batch.map((call) => call.id),
+    shard: PLANNING_SHARD_LABEL,
+    tool_index: toolIndex(calls),
+  };
+  const size = (): number => estimateTokens(JSON.stringify(state));
+  if (size() > tokenLimit * 0.20) delete state.tool_index;
+  for (const chars of [36, 0]) {
+    if (size() <= tokenLimit * 0.20) break;
+    state.dialogue_index = dialogue.map((entry) => `${entry.i} ${entry.role === 'user' ? 'u' : 'a'} ${entry.text.length}ch${chars ? ': ' + indexExcerpt(entry.text, chars) : ''}`);
+  }
+  const baseTokens = size();
+  // Per-entry estimates round up. Reserve punctuation/label overhead as well.
+  const cost = (entry: HistoryEntry): number => estimateTokens(JSON.stringify(entry)) + 2;
+  const anchors: HistoryEntry[] = [];
+  let anchorTokens = 0;
+  const anchorBudget = Math.min(4_000, Math.floor(tokenLimit * 0.18));
+  for (const entry of dialogue.slice(-6).reverse()) {
+    let anchor: HistoryEntry = textEntry(entry);
+    if (cost(anchor) > anchorBudget) {
+      // A marked verbatim tail anchors the latest point of an oversized turn.
+      const count = Math.max(40, Math.floor(anchorBudget / 2));
+      const start = Math.max(0, entry.text.length - count);
+      anchor = { ...anchor, text: entry.text.slice(start), span: { start, end: entry.text.length, total: entry.text.length } };
+    }
+    const n = cost(anchor);
+    if (anchorTokens + n > anchorBudget) continue;
+    anchors.push(anchor);
+    anchorTokens += n;
+  }
+  const capacity = tokenLimit - baseTokens - anchorTokens - 64;
+  if (capacity < 128) throw new Error('Jev state limit leaves no room for full dialogue evidence');
+  const anchorIds = new Set(anchors.filter((entry) => !entry.span).map((entry) => entry.i));
+  const pieces: HistoryEntry[] = [];
+  for (const entry of dialogue) {
+    if (anchorIds.has(entry.i)) continue;
+    const whole = textEntry(entry);
+    if (cost(whole) <= capacity) {
+      pieces.push(whole);
+      continue;
+    }
+    let start = 0;
+    while (start < entry.text.length) {
+      const piece = (end: number): HistoryEntry => ({
+        ...whole, text: entry.text.slice(start, end),
+        span: { start, end, total: entry.text.length },
+      });
+      let low = start + 1;
+      let high = entry.text.length;
+      let end = start;
+      while (low <= high) {
+        const mid = Math.floor((low + high) / 2);
+        if (cost(piece(mid)) <= capacity) { end = mid; low = mid + 1; }
+        else high = mid - 1;
+      }
+      if (end < entry.text.length && /[\uD800-\uDBFF]/.test(entry.text[end - 1] ?? '')) end -= 1;
+      if (end <= start) throw new Error('Jev state limit cannot fit a dialogue fragment');
+      pieces.push(piece(end));
+      start = end;
+    }
+  }
+  const groups: HistoryEntry[][] = [];
+  let group: HistoryEntry[] = [];
+  let used = 0;
+  for (const entry of pieces) {
+    const n = cost(entry);
+    if (group.length > 0 && used + n > capacity) {
+      groups.push(group); group = []; used = 0;
+    }
+    group.push(entry); used += n;
+  }
+  if (group.length > 0 || groups.length === 0) groups.push(group);
+  return groups.map((entries, index) => {
+    const output: CompactionState = {
+      ...state,
+      history: [...entries, ...anchors].sort((a, b) => a.i - b.i || (a.span?.start ?? 0) - (b.span?.start ?? 0)),
+      shard: `${index + 1}/${groups.length}: full dialogue evidence`,
+    };
+    const tokens = estimateTokens(JSON.stringify(output));
+    if (tokens > tokenLimit) throw new Error('internal dialogue shard planner exceeded Jev state limit');
+    return { state: output, tokens, stage: 'user + assistant verbatim across dialogue shards' };
+  });
+}
+
+/**
  * Creates multiple evidence states for one target batch.
  *
  * Preferred mode repeats every user message verbatim in every request. All
@@ -447,8 +631,8 @@ type ShardGroup = {
  * into verbatim shards. Thus every assistant message is seen in full by at least
  * one request for this target batch.
  *
- * If the mandatory all-user base itself exceeds the physical state limit, this
- * function fails explicitly rather than silently abridging user instructions.
+ * When repeating all users would crowd out evidence, both roles are covered
+ * across verbatim shards instead. Oversized messages are split with offsets.
  */
 export function fitBatchStates(
   messages: readonly Message[],
@@ -459,6 +643,12 @@ export function fitBatchStates(
 ): FittedState[] {
   const dialogue = dialogueTexts(messages);
   const assistants = dialogue.filter((entry) => entry.role === 'assistant');
+
+  const userTokens = dialogue.filter((entry) => entry.role === 'user')
+    .reduce((sum, entry) => sum + estimateTokens(JSON.stringify(textEntry(entry))) + 1, 0);
+  if (userTokens > tokenLimit * 0.4 || dialogue.some((entry) => estimateTokens(entry.text) > tokenLimit * 0.65)) {
+    return fitDialogueShards(messages, calls, batch, options, tokenLimit);
+  }
 
   // Keep a useful fresh assistant anchor in every shard, but leave most of the
   // state budget available for one historical full-text slice.
@@ -500,13 +690,7 @@ export function fitBatchStates(
     probe = base();
   }
   if (probe.tokens > tokenLimit) {
-    throw new Error(
-      'all user messages plus the minimal global dialogue index exceed the Jev state limit (~' +
-        probe.tokens +
-        ' tokens, limit ' +
-        tokenLimit +
-        '); cannot preserve every user message verbatim in each shard',
-    );
+    return fitDialogueShards(messages, calls, batch, options, tokenLimit);
   }
 
   const finalRecentIds = new Set(build.recentAnchor.map((entry) => entry.i));
@@ -555,13 +739,7 @@ export function fitBatchStates(
       };
       const single = planned([entry], minimal);
       if (!stateFits(single, tokenLimit)) {
-        throw new Error(
-          'one assistant text message cannot fit verbatim with all user messages in a Jev shard (~' +
-            single.tokens +
-            ' tokens, limit ' +
-            tokenLimit +
-            ')',
-        );
+        return fitDialogueShards(messages, calls, batch, options, tokenLimit);
       }
       groups.push({ entries: [entry], build: minimal });
       current = [];

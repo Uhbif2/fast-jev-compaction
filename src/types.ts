@@ -47,6 +47,18 @@ export interface ToolCall {
   isError: boolean;
   /** In the first or the newest preserved messages; never a candidate. */
   pinned: boolean;
+  /**
+   * The call may have changed something outside the conversation (a file, a
+   * repository, a remote service). Its record is never removed; at most its
+   * result is shortened. Unknown tools count as side-effecting.
+   */
+  sideEffects: boolean;
+  /** The result already carries a fast-jev compaction note: nothing left to shorten. */
+  compacted: boolean;
+  /** A later call with the same tool and target (same file, same command), by id. */
+  repeatedBy?: string;
+  /** A later call wrote the file this call read. */
+  targetChangedBy?: string;
 }
 
 export interface CallAnswer {
@@ -84,6 +96,8 @@ export interface HistoryEntry {
   i: number;
   role: Role;
   text: string;
+  /** Character offsets when an oversized message is split across evidence shards. */
+  span?: { start: number; end: number; total: number };
   /** Structured per call, or one compact line per call once the state has to shrink. */
   tool_calls?: HistoryToolCall[] | string[];
 }
@@ -95,7 +109,7 @@ export interface CompactionState {
   /** Full-text dialogue evidence present in this shard, chronological. */
   history: HistoryEntry[];
   /** Compact map of every text message across the whole conversation. */
-  dialogue_index?: Array<{ i: number; role: Role; excerpt: string; chars: number }>;
+  dialogue_index?: Array<{ i: number; role: Role; excerpt: string; chars: number }> | string[];
   /** Compact chronology of tool activity across the whole conversation. */
   tool_index?: string[];
   /** Tool-call ids being judged in this request; target details live in each question. */
@@ -112,6 +126,10 @@ export interface FittedState {
 }
 
 export interface CompactOptions {
+  /** Soft request budget; a complete evidence-shard group is always atomic. Default 16. */
+  maxJevRequests?: number;
+  /** Host sweep state: already-reviewed ids go after unreviewed candidates. Never authorizes deletion. */
+  recentlyReviewedToolUseIds?: readonly string[];
   /** Ongoing task description; defaults to the last few user prompts. */
   goal?: string;
   /** Minimum keep probability for a call or result to stay. Default 0.5. */
@@ -131,6 +149,8 @@ export interface CompactOptions {
 }
 
 export interface ResolvedCompactOptions {
+  maxJevRequests: number;
+  recentlyReviewedToolUseIds: readonly string[];
   goal: string;
   keepThreshold: number;
   preserveRecentMessages: number;
@@ -142,6 +162,8 @@ export interface ResolvedCompactOptions {
 }
 
 export interface CompactResult {
+  /** Calls scored against every evidence shard in this pass; for the host's sweep cursor. */
+  reviewedToolUseIds: string[];
   /** The compacted transcript; untouched messages are the input objects. */
   messages: Message[];
   decisions: CallDecision[];
@@ -159,6 +181,12 @@ export interface CompactResult {
     assistantTexts: number;
     assistantTextsKept: number;
     assistantTextsDropped: number;
+    /** Candidates Jev was asked about; the rest had nothing left to shorten. */
+    asked: number;
+    /** Eligible calls safely deferred to a later pass by the request budget. */
+    deferred: number;
+    /** Result keep probabilities of the asked calls, bucketed: <0.1, <0.3, <0.5, <0.9, >=0.9. */
+    resultScores: [number, number, number, number, number];
     stateTokens: number;
     /** Which fitting stage the state needed, '' when no request was made. */
     stateStage: string;

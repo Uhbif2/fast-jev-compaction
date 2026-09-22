@@ -28,7 +28,7 @@
 
 ```text
 compactAtPercent=30
-keepThreshold=0.01
+keepThreshold=0.5
 preserveRecentMessages=12
 minReductionRatio=0
 compactAssistantText=false
@@ -37,7 +37,14 @@ maxRequestTokens=62000
 resultPreviewChars=1000
 truncateHeadChars=300
 model=jev-latest
+maxJevRequests=16
 ```
+
+В local.11 deadline охватывает зависший HTTP, а большие user/assistant-сообщения полностью
+покрываются evidence shards. Уже усечённые результаты пропускаются; новые кандидаты проверяются
+в порядке возможной экономии, с мягким бюджетом запросов. Непроверенные сохраняются (`deferred`).
+Записи действий с возможным побочным эффектом сохраняются. В усечённом результате остаются
+голова, хвост и ссылка по tool_use_id на оригинал в транскрипте.
 
 `/reload-plugins` может не переключить уже живой Code runtime на новый versioned hook cache.
 Проверять `LOCAL_BUILD` в toast; если marker старый — открыть новый Code runtime или
