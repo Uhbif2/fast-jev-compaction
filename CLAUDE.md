@@ -28,7 +28,7 @@
   Не делегировать автоматически в built-in Claude summary: это может тратить квоту подписки.
 - Запросы Jev идут последовательно, чтобы не создавать burst/rate-limit каскад.
 - Не логировать state, tool result contents, API key или Authorization.
-- Секрет TypeSafe только через `TYPESAFE_API_KEY`/sensitive plugin option. Никогда не читать,
+- Секрет TypeSafe — sensitive-опция `apiKey` (с 22.09.2026 лежит в `~/.claude/.credentials.json` → `pluginSecrets`, под масками флота); `TYPESAFE_API_KEY` в окружении — только запасной путь, в `settings.json` его нет. Никогда не читать,
   печатать, переносить или коммитить файл с ключом ради этой миграции.
 
 ## Технические ограничения Jev

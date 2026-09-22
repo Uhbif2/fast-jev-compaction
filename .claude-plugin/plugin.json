@@ -1,13 +1,13 @@
 {
   "name": "fast-jev-compaction-local",
-  "version": "0.3.0-local.8",
+  "version": "0.3.0-local.9",
   "description": "Local hardened fast-jev compaction: Jev-only (never a Claude summary), conservative tool relevance scoring, result previews, sharded dialogue context, bounded retries.",
   "license": "MIT",
   "userConfig": {
     "apiKey": {
       "type": "string",
       "title": "TypeSafe API key",
-      "description": "TypeSafe API key. Leave unset to use TYPESAFE_API_KEY.",
+      "description": "TypeSafe API key, kept in Claude Code secure storage. Falls back to TYPESAFE_API_KEY in the environment; not read from settings.json.",
       "sensitive": true
     },
     "keepThreshold": {

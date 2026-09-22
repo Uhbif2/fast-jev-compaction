@@ -7,7 +7,7 @@
 - Upstream: tamaratran/fast-jev-compaction 0.3.0.
 - Local plugin: fast-jev-compaction-local@fast-jev-compaction-local.
 - Upstream установлен отдельно и disabled.
-- Текущий local release: 0.3.0-local.8.
+- Текущий local release: 0.3.0-local.9.
 - Единственный рабочий исходник: `C:\MCPs\fast-jev-compaction-local` (свой git с 22.09.2026;
   базовая точка — тег `v0.3.0-local.7`). Local marketplace указывает сюда.
 
@@ -68,17 +68,25 @@ Jev оставил выше порога, запускал бы компакци
 Function hooks требуют >=2.1.274; при разработке проверена bundled 2.1.275 в Claude Desktop.
 Отдельная PATH-версия (2.1.212) старее и не должна использоваться для диагностики Desktop hook.
 
-После plugin update живой Code runtime может удерживать старый versioned hook даже после
-/reload-plugins. Проверять LOCAL_BUILD в toast (`fast-jev 0.3.0-local.8 [trigger]`). Если
-marker старый — открыть новый Code runtime/переоткрыть Code-чат, не перезапуская весь Desktop
-без необходимости.
+После plugin update живой Code runtime держит старый versioned hook и после
+`/reload-plugins` — проверено 22.09: `/reload-plugins` в 06:16:40Z, а `/compact` в 06:16:52Z
+отработал ещё на local.7. Какую версию держит процесс, видно без догадок:
+`~/.claude/plugins/cache/fast-jev-compaction-local/fast-jev-compaction-local/<версия>/.in_use/<pid>`
+(в файле `procStartFt` — время старта процесса, FILETIME). Новая версия подхватывается только
+новым Code runtime: переоткрыть Code-чат, весь Desktop не перезапускать. В toast — маркер
+`fast-jev <LOCAL_BUILD> [trigger]`.
 
 ## Проверенные наблюдения
 
 Один ранний Jev run: 282234 -> 47887 примерно за 1.7 s, без isCompactSummary.
 
-После sharding один /compact может занимать 15–30+ секунд: несколько Jev requests идут
-последовательно. Длительность сама по себе не означает fallback.
+Длительность не означает, что сработал fallback. На разговоре в 229 сообщений со 106 парами
+инструментов (реплей 22.09) Jev-компакция — это 6 последовательных запросов, 10–20 с. До local.9
+к ним добавлялись ~3.3 с синхронного планирования до первого запроса: планировщик был
+квадратичным. 22.09 такую компакцию прервали на 15-й секунде, приняв её за встроенную.
+Встроенное саммари на том же объёме — 40–120 с, и оно оставляет в транскрипте
+`isCompactSummary` и boundary с `preservedSegment`. С local.9 Jev виден по ходу: toast
+`fast-jev … Jev request k/N, t s` (не чаще раза в 3 с), итог — отдельным toast.
 
 `preTokens`/`postTokens` в `compact_boundary` **не доказывают эффект**. До local.8 при ошибке
 и no-op хук возвращал исходные сообщения, движок всё равно писал boundary (no-op 21.09:

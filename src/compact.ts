@@ -4,6 +4,7 @@ import type {
   AssistantTextDecision,
   CallAnswer,
   CallDecision,
+  CompactObserver,
   CompactOptions,
   CompactResult,
   CompactionState,
@@ -344,69 +345,67 @@ type BatchPlan = {
   states: FittedState[];
 };
 
-function makeBatchPlan(
-  messages: readonly Message[],
-  calls: readonly ToolCall[],
-  batch: readonly ToolCall[],
-  options: ResolvedCompactOptions,
-): BatchPlan | null {
-  const q = questionTokenStats(batch);
-  const stateLimit = Math.min(
-    options.maxStateTokens,
-    JEV_STATE_PLUS_LONGEST_QUESTION_TOKENS -
-      q.longest -
-      REQUEST_OVERHEAD_TOKENS -
-      CONTEXT_SAFETY_MARGIN_TOKENS,
-  );
-  if (stateLimit < 1) {
-    throw new Error('a Jev question is too large to leave room for conversation state');
-  }
-
-  const states = fitBatchStates(messages, calls, batch, options, stateLimit);
-  const requestLimit = Math.min(options.maxRequestTokens, JEV_TOTAL_REQUEST_TOKENS);
-  for (const state of states) {
-    if (
-      state.tokens + q.longest + REQUEST_OVERHEAD_TOKENS >
-      JEV_STATE_PLUS_LONGEST_QUESTION_TOKENS
-    ) {
-      throw new Error('batch shard exceeds Jev 32k state+longest-question limit');
-    }
-    if (state.tokens + q.total + REQUEST_OVERHEAD_TOKENS > requestLimit) return null;
-  }
-  return { batch: [...batch], states };
+/** The same shard with `evaluating` narrowed to one batch; never larger than the layout. */
+function stateForBatch(layout: FittedState, batch: readonly ToolCall[]): FittedState {
+  const state: CompactionState = { ...layout.state, evaluating: batch.map((call) => call.id) };
+  return { state, tokens: estimateTokens(JSON.stringify(state)), stage: layout.stage };
 }
 
+/**
+ * Plans every request in one pass. The shard layout does not depend on the
+ * batch except for `evaluating`, so it is fitted once with every candidate
+ * listed there (no batch lists more) and under the longest question of all;
+ * questions are then packed greedily against the largest shard. Linear in the
+ * candidates, where fitting shards per growing batch was quadratic.
+ */
 function planBatches(
   messages: readonly Message[],
   calls: readonly ToolCall[],
   candidates: readonly ToolCall[],
   options: ResolvedCompactOptions,
 ): BatchPlan[] {
-  const plans: BatchPlan[] = [];
+  const sized = candidates.map((call) => {
+    const sizes = Object.values(questionsFor(call)).map((q) => estimateTokens(JSON.stringify(q)));
+    return { call, total: sizes.reduce((sum, n) => sum + n, 0), longest: Math.max(0, ...sizes) };
+  });
+  const longest = Math.max(0, ...sized.map((entry) => entry.longest));
+  const stateLimit = Math.min(
+    options.maxStateTokens,
+    JEV_STATE_PLUS_LONGEST_QUESTION_TOKENS -
+      longest -
+      REQUEST_OVERHEAD_TOKENS -
+      CONTEXT_SAFETY_MARGIN_TOKENS,
+  );
+  if (stateLimit < 1) {
+    throw new Error('a Jev question is too large to leave room for conversation state');
+  }
+  const layout = fitBatchStates(messages, calls, candidates, options, stateLimit);
+  const stateTokens = Math.max(...layout.map((state) => state.tokens));
+  if (stateTokens + longest + REQUEST_OVERHEAD_TOKENS > JEV_STATE_PLUS_LONGEST_QUESTION_TOKENS) {
+    throw new Error('batch shard exceeds Jev 32k state+longest-question limit');
+  }
+  const requestLimit = Math.min(options.maxRequestTokens, JEV_TOTAL_REQUEST_TOKENS);
+
+  const batches: ToolCall[][] = [];
   let current: ToolCall[] = [];
-  for (const call of candidates) {
-    const proposed = [...current, call];
-    const plan = makeBatchPlan(messages, calls, proposed, options);
-    if (plan) {
-      current = proposed;
-      continue;
-    }
-    if (current.length === 0) {
+  let used = 0;
+  for (const { call, total } of sized) {
+    if (stateTokens + total + REQUEST_OVERHEAD_TOKENS > requestLimit) {
       throw new Error('one Jev candidate cannot fit within the request limits');
     }
-    const completed = makeBatchPlan(messages, calls, current, options);
-    if (!completed) throw new Error('internal batching error');
-    plans.push(completed);
-    current = [call];
-    const single = makeBatchPlan(messages, calls, current, options);
-    if (!single) throw new Error('one Jev candidate cannot fit within the request limits');
+    if (current.length > 0 && stateTokens + used + total + REQUEST_OVERHEAD_TOKENS > requestLimit) {
+      batches.push(current);
+      current = [];
+      used = 0;
+    }
+    current.push(call);
+    used += total;
   }
-  if (current.length > 0) {
-    const completed = makeBatchPlan(messages, calls, current, options);
-    if (!completed) throw new Error('internal batching error');
-    plans.push(completed);
-  }
-  return plans;
+  if (current.length > 0) batches.push(current);
+  return batches.map((batch) => ({
+    batch,
+    states: layout.map((state) => stateForBatch(state, batch)),
+  }));
 }
 
 function truncatedResultText(text: string, isError: boolean, headChars: number): string {
@@ -542,6 +541,7 @@ export async function compact(
   messages: readonly Message[],
   asker: JevAsker,
   options: CompactOptions = {},
+  observer: CompactObserver = {},
 ): Promise<CompactResult> {
   const started = Date.now();
   const resolved = resolveOptions(options);
@@ -561,6 +561,12 @@ export async function compact(
   let maxStateTokens = 0;
   let maxShards = 0;
   let requestCount = 0;
+  let plannedRequests = 0;
+  const nextRequest = (): void => {
+    requestCount += 1;
+    plannedRequests = Math.max(plannedRequests, requestCount);
+    observer.request?.(requestCount, plannedRequests);
+  };
   const answers = new Map<string, CallAnswer>();
   const assistantScores = new Map<number, number>();
 
@@ -590,6 +596,9 @@ export async function compact(
 
   if (toolCandidates.length > 0) {
     const plans = planBatches(messages, calls, toolCandidates, resolved);
+    // Assistant-text questions, when enabled, may add requests to this count.
+    plannedRequests = plans.reduce((sum, plan) => sum + plan.states.length, 0);
+    observer.planned?.(plannedRequests);
     for (let planIndex = 0; planIndex < plans.length; planIndex += 1) {
       const plan = plans[planIndex]!;
       maxShards = Math.max(maxShards, plan.states.length);
@@ -611,7 +620,7 @@ export async function compact(
         );
 
         if (assistantBatches.length === 0) {
-          requestCount += 1;
+          nextRequest();
           const answered = await askBatch(asker, state.state, plan.batch);
           mergeCallAnswers(answered.calls);
           continue;
@@ -619,7 +628,7 @@ export async function compact(
 
         for (let groupIndex = 0; groupIndex < assistantBatches.length; groupIndex += 1) {
           const group = assistantBatches[groupIndex]!;
-          requestCount += 1;
+          nextRequest();
           const answered = await askBatch(
             asker,
             state.state,
@@ -645,13 +654,15 @@ export async function compact(
     }
     const states = fitBatchStates(messages, calls, [], resolved, stateLimit);
     maxShards = states.length;
+    plannedRequests = states.length;
+    observer.planned?.(plannedRequests);
     for (const state of states) {
       stages.add(state.stage);
       maxStateTokens = Math.max(maxStateTokens, state.tokens);
       const assistantIndices = assistantIndicesInState(state);
       const groups = batchAssistantIndices(assistantIndices, state.tokens, resolved);
       for (const group of groups) {
-        requestCount += 1;
+        nextRequest();
         const answered = await askBatch(asker, state.state, [], group);
         mergeAssistantAnswers(answered.assistantTexts);
       }

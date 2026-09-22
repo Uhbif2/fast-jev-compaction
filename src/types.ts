@@ -226,6 +226,14 @@ export interface JevResponse {
   [key: string]: unknown;
 }
 
+/** Progress of one compaction, for a host that shows it. */
+export interface CompactObserver {
+  /** Requests planned once batching is done; assistant-text questions may add more. */
+  planned?(requests: number): void;
+  /** Before each Jev request: its 1-based index and the planned total so far. */
+  request?(index: number, planned: number): void;
+}
+
 /** Anything that can answer Jev questions: `JevClient`, or a host-provided adapter. */
 export interface JevAsker {
   ask(state: JevState, questions: JevQuestions): Promise<JevResponse>;

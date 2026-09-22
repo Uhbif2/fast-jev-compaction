@@ -15,6 +15,7 @@ import { buildJevRequest, DEFAULT_MODEL, parseJevResponse } from '../src/request
 declare const setTimeout: (handler: () => void, timeoutMs: number) => unknown;
 
 import type {
+  CompactObserver,
   CompactOptions,
   CompactResult,
   JevAsker,
@@ -49,7 +50,7 @@ export type HookFetch = (url: string, init?: HookFetchInit) => Promise<HookFetch
 /** Waits between retries; the hook passes `$.clock.sleep`, tests pass an instant one. */
 export type HookSleep = (ms: number) => Promise<void>;
 
-export const LOCAL_BUILD = '0.3.0-local.8';
+export const LOCAL_BUILD = '0.3.0-local.9';
 
 export const JEV_MAX_ATTEMPTS = 6;
 const JEV_RETRY_DELAYS_MS = [1_000, 2_000, 4_000, 8_000, 15_000];
@@ -285,10 +286,11 @@ export async function compactSession(
   log: (text: string) => void = () => {},
   transport: JevTransportStats = emptyTransportStats(),
   sleep: HookSleep = timerSleep,
+  observer: CompactObserver = {},
 ): Promise<SessionCompaction> {
   if (!config.apiKey) throw new Error('TYPESAFE_API_KEY is not configured');
   const asker = jevAsker(fetchFn, config.apiKey, config.model, log, transport, sleep);
-  const result = await compact(messages, asker, config);
+  const result = await compact(messages, asker, config, observer);
   return { result, messages: toSessionMessages(messages, result.messages) };
 }
 
@@ -357,23 +359,18 @@ export function decisionLogLines(
   );
 }
 
+/**
+ * The key comes from the sensitive `apiKey` option (Claude Code keeps it in
+ * its secure storage). TYPESAFE_API_KEY in the process environment is only a
+ * fallback; settings.json is deliberately not read: a key there is plain text
+ * that every child process inherits.
+ */
 async function getApiKey(
-  $: {
-    env: { get: (name: string) => Promise<string | undefined> };
-    settings: { read: () => Promise<Readonly<Record<string, unknown>>> };
-  },
+  $: { env: { get: (name: string) => Promise<string | undefined> } },
   config: HookConfig,
 ): Promise<string | undefined> {
   if (config.apiKey) return config.apiKey;
-  const fromEnv = await $.env.get('TYPESAFE_API_KEY');
-  if (fromEnv) return fromEnv;
-  const settings = await $.settings.read();
-  const env = settings['env'];
-  if (env && typeof env === 'object') {
-    const value = (env as Record<string, unknown>)['TYPESAFE_API_KEY'];
-    if (typeof value === 'string' && value) return value;
-  }
-  return undefined;
+  return (await $.env.get('TYPESAFE_API_KEY')) || undefined;
 }
 
 type NotifyTarget = {
@@ -381,16 +378,63 @@ type NotifyTarget = {
     log: (text: string) => void;
     toast: (text: string, options?: { timeoutMs?: number }) => void;
   };
+  clock: { sleep: (ms: number) => Promise<void> };
 };
 
-/** Log and toast; never throws, so a failing UI cannot turn into a failing compaction. */
-function notify($: NotifyTarget, text: string): void {
+/**
+ * The engine drops a toast that comes too soon after the previous one ("within
+ * N ms of the last; dropped"): a failure right after the start notice used to
+ * vanish that way. Kept above the engine's gap.
+ */
+export const TOAST_GAP_MS = 3_000;
+
+/** When the last toast went out; one per plugin instance, shared by its hooks. */
+export type ToastGate = { last: number; now: () => number };
+
+export function toastGate(now: () => number = Date.now): ToastGate {
+  return { last: Number.NEGATIVE_INFINITY, now };
+}
+
+function logNotice($: NotifyTarget, text: string): void {
   try {
     $.ui.log(text);
-    $.ui.toast(text, { timeoutMs: 15_000 });
   } catch {
     // The hook's answer matters more than the notice.
   }
+}
+
+function showNotice($: NotifyTarget, gate: ToastGate, text: string): void {
+  logNotice($, text);
+  try {
+    $.ui.toast(text, { timeoutMs: 15_000 });
+  } catch {
+    // As above: never let the UI fail a compaction.
+  }
+  gate.last = gate.now();
+}
+
+/** Toast when the last one is far enough back, else only log: for progress. */
+export function progressNotice($: NotifyTarget, gate: ToastGate, text: string): void {
+  if (gate.now() - gate.last >= TOAST_GAP_MS) showNotice($, gate, text);
+  else logNotice($, text);
+}
+
+/** Always toasted: waits out the gap first. For the start and the outcome. */
+export async function sayNotice($: NotifyTarget, gate: ToastGate, text: string): Promise<void> {
+  const wait = gate.last + TOAST_GAP_MS - gate.now();
+  if (wait > 0) {
+    try {
+      await $.clock.sleep(wait);
+    } catch {
+      // Shown a little early rather than not at all.
+    }
+  }
+  showNotice($, gate, text);
+}
+
+async function skipWith($: NotifyTarget, gate: ToastGate, reason: string): Promise<SessionCompactResult> {
+  await sayNotice($, gate, reason);
+  return { skip: reason };
 }
 
 function errorText(error: unknown): string {
@@ -403,6 +447,7 @@ function tokensText(tokens: number): string {
 
 export const register: Register = (on: On, options: PluginOptions) => {
   const configured = resolveHookConfig(options);
+  const gate = toastGate();
   let compacting = false;
   /** Context size when auto-compaction last ran; the next run waits for real growth. */
   let lastAutoTokens: number | undefined;
@@ -428,23 +473,31 @@ export const register: Register = (on: On, options: PluginOptions) => {
         ? assistantTextCandidateIndices(event.messages, resolvedPreflight.preserveRecentMessages).length
         : 0;
       if (eligible === 0 && assistantEligible === 0) {
-        const reason = `${tag}: nothing eligible (${pinned} pinned tool pair(s)); session unchanged, no Jev request`;
-        notify($, reason);
-        return { skip: reason };
+        return await skipWith($, gate, `${tag}: nothing eligible (${pinned} pinned tool pair(s)); session unchanged, no Jev request`);
       }
 
-      notify(
+      await sayNotice(
         $,
+        gate,
         `${tag}: Jev compaction of ${eligible} tool pair(s)` +
           (assistantEligible > 0 ? ` and ${assistantEligible} assistant text(s)` : '') +
-          `, ${pinned} pinned`,
+          `, ${pinned} pinned; Claude summary off`,
       );
+      let tokensBefore: number | undefined;
+      if (event.agentId === undefined) {
+        try {
+          tokensBefore = (await $.session.usage()).context.tokens;
+        } catch {
+          // Only the effect report needs it.
+        }
+      }
       const config: HookConfig = {
         ...configured,
         apiKey: await getApiKey($, configured),
       };
       const goal = compactionGoal(event.messages, configured, event.instructions);
       if (goal) config.goal = goal;
+      const started = Date.now();
       const { result, messages } = await compactSession(
         event.messages,
         config,
@@ -455,27 +508,29 @@ export const register: Register = (on: On, options: PluginOptions) => {
         (line) => $.ui.log(line),
         transport,
         (ms) => $.clock.sleep(ms),
+        {
+          request: (index, planned) =>
+            progressNotice($, gate, `${tag}: Jev request ${index}/${planned}, ${Math.round((Date.now() - started) / 1000)} s`),
+        },
       );
       for (const line of decisionLogLines(result)) $.ui.log(line);
       if (result.stats.requests === 0 || reductionRatio(result) <= 0) {
-        const reason = `${tag}: Jev kept everything; session unchanged (${summarize(result)})`;
-        notify($, reason);
-        return { skip: reason };
+        return await skipWith($, gate, `${tag}: Jev kept everything; session unchanged (${summarize(result)})`);
       }
       if (reductionRatio(result) < config.minReductionRatio) {
-        const reason = `${tag}: reduction below the ${percent(config.minReductionRatio)} minimum; session unchanged (${summarize(result)})`;
-        notify($, reason);
-        return { skip: reason };
+        return await skipWith($, gate, 
+          `${tag}: reduction below the ${percent(config.minReductionRatio)} minimum; session unchanged (${summarize(result)})`,
+        );
       }
-      notify(
+      await sayNotice(
         $,
-        `${tag}: kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(result)}; ${transportSummary(transport)})`,
+        gate,
+        `${tag}: kept ${messages.length}/${event.messages.length} messages in ${Math.round((Date.now() - started) / 1000)} s, no summary (${summarize(result)}; ${transportSummary(transport)})`,
       );
+      if (tokensBefore !== undefined) effectPending = tokensBefore;
       return { messages };
     } catch (error) {
-      const reason = `${tag}: Jev compaction failed, session unchanged, no Claude summary (${errorText(error)})`;
-      notify($, reason);
-      return { skip: reason };
+      return await skipWith($, gate, `${tag}: Jev compaction failed, session unchanged, no Claude summary (${errorText(error)})`);
     }
   });
 
@@ -490,8 +545,9 @@ export const register: Register = (on: On, options: PluginOptions) => {
       const { context } = await $.session.usage();
       if (context.tokens === undefined || context.percent === undefined) return answer;
       if (effectPending !== undefined) {
-        notify(
+        await sayNotice(
           $,
+          gate,
           `fast-jev ${LOCAL_BUILD}: first request after compaction carried ${tokensText(context.tokens)} tokens (before: ${tokensText(effectPending)})`,
         );
         effectPending = undefined;
@@ -507,14 +563,13 @@ export const register: Register = (on: On, options: PluginOptions) => {
       $.ui.log(
         `fast-jev ${LOCAL_BUILD}: context ${context.percent}% >= ${configured.compactAtPercent}%, auto-compacting`,
       );
-      const outcome = await $.session.compact();
+      await $.session.compact();
       lastAutoTokens = context.tokens;
       lastAutoError = '';
-      if (outcome.messages) effectPending = context.tokens;
     } catch (error) {
-      const text = errorText(error);
-      if (text !== lastAutoError) notify($, `fast-jev ${LOCAL_BUILD}: auto-compact did not run (${text})`);
-      else $.ui.log(`fast-jev ${LOCAL_BUILD}: auto-compact did not run (${text})`);
+      const text = `fast-jev ${LOCAL_BUILD}: auto-compact did not run (${errorText(error)})`;
+      if (text !== lastAutoError) progressNotice($, gate, text);
+      else $.ui.log(text);
       lastAutoError = text;
     } finally {
       compacting = false;

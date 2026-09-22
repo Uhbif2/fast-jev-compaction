@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { collectToolCalls, fitBatchStates, type Message } from '../src/index.js';
+import { collectToolCalls, compact, fitBatchStates, type JevAsker, type Message } from '../src/index.js';
 
 function message(role: Message['role'], text: string, extra: Partial<Message> = {}): Message {
   return { role, text, toolUses: [], ...extra };
@@ -44,5 +44,44 @@ describe('shard planner limits', () => {
       const seen = states.flatMap((state) => state.state.history.map((entry) => entry.text));
       expect(seen).toContain('word '.repeat(2350));
     }
+  });
+});
+
+describe('planning cost', () => {
+  function longSession(pairs: number): Message[] {
+    const note = 'Сборка упала, потому что путь к конфигу неверный; проверю загрузчик. ';
+    const messages: Message[] = [message('user', note.repeat(20))];
+    for (let i = 0; i < pairs; i += 1) {
+      if (i % 5 === 0) messages.push(message('user', note.repeat(4)));
+      if (i % 2 === 0) messages.push(message('assistant', note.repeat(6)));
+      const out = `line ${i} ${'x'.repeat(70)}\n`.repeat(60);
+      messages.push(
+        message('assistant', '', { toolUses: [{ tool_use_id: `u${i}`, tool: 'Read', input: { file_path: `/repo/f${i}.ts` }, text: out }] }),
+        message('user', '', { toolResults: [{ tool_use_id: `u${i}`, text: out }] }),
+      );
+    }
+    return messages;
+  }
+
+  it('plans a long session in well under a second of CPU and reports progress', async () => {
+    const planned: number[] = [];
+    const requests: Array<[number, number]> = [];
+    let firstAskAt = 0;
+    const started = performance.now();
+    const asker: JevAsker = {
+      async ask(_state, questions) {
+        if (!firstAskAt) firstAskAt = performance.now();
+        return { answers: Object.fromEntries(Object.keys(questions).map((k) => [k, { noul: 0.5 }])) };
+      },
+    };
+    const result = await compact(longSession(150), asker, { keepThreshold: 0.01, preserveRecentMessages: 12 }, {
+      planned: (n) => planned.push(n),
+      request: (index, total) => requests.push([index, total]),
+    });
+    // Was ~9.6 s before planning became linear in the candidates.
+    expect(firstAskAt - started).toBeLessThan(1_500);
+    expect(planned).toEqual([result.stats.requests]);
+    expect(requests.map(([index]) => index)).toEqual(Array.from({ length: result.stats.requests }, (_, i) => i + 1));
+    expect(requests.every(([, total]) => total === result.stats.requests)).toBe(true);
   });
 });
