@@ -426,6 +426,19 @@ function stateFits(state: FittedState, tokenLimit: number): boolean {
 }
 
 /**
+ * Shards are planned under a label that costs at least as much as any final
+ * one ('N/M: historical assistant slice', '1/1: all assistant text in recent
+ * anchor'), so relabelling a planned shard can never push it over the limit.
+ */
+const PLANNING_SHARD_LABEL =
+  '9999/9999: historical assistant slice; all assistant text in recent anchor';
+
+type ShardGroup = {
+  entries: DialogueText[];
+  build: ShardBuildOptions;
+};
+
+/**
  * Creates multiple evidence states for one target batch.
  *
  * Preferred mode repeats every user message verbatim in every request. All
@@ -460,7 +473,7 @@ export function fitBatchStates(
   };
 
   const base = (): FittedState =>
-    buildShardState(messages, calls, batch, [], options, build, 'base');
+    buildShardState(messages, calls, batch, [], options, build, PLANNING_SHARD_LABEL);
 
   // Aim to leave at least ~25% of state capacity for a historical full-text
   // slice; this is a soft target, not a content deletion rule.
@@ -506,48 +519,41 @@ export function fitBatchStates(
     return [probe];
   }
 
-  const groups: DialogueText[][] = [];
+  const groups: ShardGroup[] = [];
   let current: DialogueText[] = [];
 
-  const fitsGroup = (group: readonly DialogueText[]): FittedState =>
-    buildShardState(messages, calls, batch, group, options, build, 'planning');
+  const planned = (
+    group: readonly DialogueText[],
+    groupBuild: ShardBuildOptions = build,
+  ): FittedState =>
+    buildShardState(messages, calls, batch, group, options, groupBuild, PLANNING_SHARD_LABEL);
 
   for (const entry of historical) {
     const proposed = [...current, entry];
-    const test = fitsGroup(proposed);
-    if (stateFits(test, tokenLimit)) {
+    if (stateFits(planned(proposed), tokenLimit)) {
       current = proposed;
       continue;
     }
 
     if (current.length > 0) {
-      groups.push(current);
+      groups.push({ entries: current, build });
       // One-message overlap gives local continuity across shard boundaries.
-      const overlap = current.slice(-1);
-      const withOverlap = [...overlap, entry];
-      if (stateFits(fitsGroup(withOverlap), tokenLimit)) current = withOverlap;
-      else current = [entry];
+      const withOverlap = [...current.slice(-1), entry];
+      current = stateFits(planned(withOverlap), tokenLimit) ? withOverlap : [entry];
     } else {
       current = [entry];
     }
 
-    if (!stateFits(fitsGroup(current), tokenLimit)) {
+    if (!stateFits(planned(current), tokenLimit)) {
       // For one unusually large assistant message, remove every optional global
-      // structure before conceding that the message itself cannot fit.
+      // structure before conceding that the message itself cannot fit. The
+      // shard keeps that minimal build: the final state is built from it too.
       const minimal: ShardBuildOptions = {
         indexChars: 24,
         includeToolIndex: false,
         recentAnchor: [],
       };
-      const single = buildShardState(
-        messages,
-        calls,
-        batch,
-        [entry],
-        options,
-        minimal,
-        'single-large-message',
-      );
+      const single = planned([entry], minimal);
       if (!stateFits(single, tokenLimit)) {
         throw new Error(
           'one assistant text message cannot fit verbatim with all user messages in a Jev shard (~' +
@@ -557,22 +563,20 @@ export function fitBatchStates(
             ')',
         );
       }
-      if (groups.length === 0 || groups.at(-1) !== current) {
-        groups.push([entry]);
-      }
+      groups.push({ entries: [entry], build: minimal });
       current = [];
     }
   }
-  if (current.length > 0) groups.push(current);
+  if (current.length > 0) groups.push({ entries: current, build });
 
   const states = groups.map((group, index) => {
     const state = buildShardState(
       messages,
       calls,
       batch,
-      group,
+      group.entries,
       options,
-      build,
+      group.build,
       String(index + 1) + '/' + String(groups.length) + ': historical assistant slice',
     );
     if (!stateFits(state, tokenLimit)) {

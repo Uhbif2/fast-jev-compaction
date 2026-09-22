@@ -52,7 +52,7 @@ export interface ToolCall {
 export interface CallAnswer {
   /** Jev's probability that the call itself still matters. */
   keepCall: number;
-  /** Jev's probability that the full result still needs to stay verbatim. */
+  /** Jev's probability that the result content is still relevant to continuing. */
   keepResult: number;
 }
 
@@ -118,15 +118,15 @@ export interface CompactOptions {
   keepThreshold?: number;
   /** Newest messages never touched (the first message is always kept). Default 6. */
   preserveRecentMessages?: number;
-  /** Estimated token ceiling for the state. Default 25000. */
+  /** Estimated token ceiling for one Jev state (hard-clamped to 31000, below the 32k state+question limit). Default 31000. */
   maxStateTokens?: number;
-  /** Estimated token ceiling for state plus one batch of questions. Default 30000. */
+  /** Estimated token ceiling for one whole Jev request (hard-clamped to 62000, below the 64k limit). Default 62000. */
   maxRequestTokens?: number;
   /** Characters of a dropped tool result to retain. Default 300. */
   truncateHeadChars?: number;
   /** Characters from each end of a tool result shown to Jev while scoring it. Default 1000. */
   resultPreviewChars?: number;
-  /** Also score old assistant text for relevance; user text is never removed. Default true in the local fork. */
+  /** Also score old assistant text for relevance; user text is never removed. Default false. */
   compactAssistantText?: boolean;
 }
 
