@@ -60,7 +60,7 @@ const timerDeadline: DeadlineWait = (ms) => {
   return { expired, cancel: () => clearTimeout(timer) };
 };
 
-export const LOCAL_BUILD = '0.3.0-local.11';
+export const LOCAL_BUILD = '0.3.0-local.12';
 
 export const JEV_MAX_ATTEMPTS = 6;
 const JEV_RETRY_DELAYS_MS = [1_000, 2_000, 4_000, 8_000, 15_000];

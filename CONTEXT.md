@@ -7,7 +7,7 @@
 - Upstream: tamaratran/fast-jev-compaction 0.3.0.
 - Local plugin: fast-jev-compaction-local@fast-jev-compaction-local.
 - Upstream установлен отдельно и disabled.
-- Текущий local release: 0.3.0-local.11.
+- Текущий local release: 0.3.0-local.12.
 - Единственный рабочий исходник: `<repo>` (свой git с 22.09.2026;
   базовая точка — тег `v0.3.0-local.7`). Local marketplace указывает сюда.
 
@@ -60,6 +60,12 @@ maxJevRequests=16
 
 Профиль перечитан из settings 22.09: порог уже был 0.5, прежнее значение 0.01 в документах
 устарело. В local.11 профиль владельца не менялся.
+
+## Изменения local.12
+
+- Уже сокращённый result считается сокращённым только по настоящей служебной заметке с тем же `tool_use_id` (или по legacy-формату), а не по любому вхождению строки `[fast-jev-compaction `. Это убирает ложные срабатывания на исходниках/чужих заметках и повторную оценку собственных новых truncation notes.
+- `scripts/replay.ts --before-boundary` восстанавливает именно ветку от `compact_boundary.parentUuid`; поздняя sibling-ветка больше не подменяет историю в проверочном скрипте. Добавлен регрессионный тест.
+- Release gate 22.09: typecheck зелёный; 62/62 unit tests зелёные; live synthetic fork сохранил весь диалог и без Claude summary сократил 25 626 → 1 705 символов (~93%). Проверка исходного рабочего transcript отдельно ограничена доступом клиента к `.claude`; обход защиты не используется.
 
 ## Изменения local.11
 

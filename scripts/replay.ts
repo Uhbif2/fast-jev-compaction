@@ -9,14 +9,20 @@ import type { Message, JevAsker } from '../src/types.js';
 type Row = { uuid?: string; parentUuid?: string; type?: string; subtype?: string;
   isSidechain?: boolean; message?: { role: string; content: any; usage?: any }; compactMetadata?: any };
 
-export function activeMessages(path: string, beforeBoundary = false): Message[] {
-  let rows = readFileSync(path, 'utf8').split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line) as Row);
+export function activeMessagesFromRows(inputRows: readonly Row[], beforeBoundary = false): Message[] {
+  let rows = [...inputRows];
+  let boundaryParentUuid: string | undefined;
   if (beforeBoundary) {
     const index = rows.findLastIndex((row) => row.subtype === 'compact_boundary');
-    if (index >= 0) rows = rows.slice(0, index);
+    if (index >= 0) {
+      boundaryParentUuid = rows[index]?.parentUuid;
+      rows = rows.slice(0, index);
+    }
   }
   const byId = new Map(rows.filter((row) => row.uuid).map((row) => [row.uuid!, row]));
-  const leaf = rows.findLast((row) => !row.isSidechain && ['user', 'assistant'].includes(row.type ?? ''));
+  const leaf = boundaryParentUuid
+    ? byId.get(boundaryParentUuid)
+    : rows.findLast((row) => !row.isSidechain && ['user', 'assistant'].includes(row.type ?? ''));
   const chain: Row[] = [];
   const visited = new Set<string>();
   let cursor = leaf;
@@ -44,6 +50,11 @@ export function activeMessages(path: string, beforeBoundary = false): Message[] 
     if (result) { tool.text = result.text; tool.isError = result.isError; }
   }
   return messages;
+}
+
+export function activeMessages(path: string, beforeBoundary = false): Message[] {
+  const rows = readFileSync(path, 'utf8').split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line) as Row);
+  return activeMessagesFromRows(rows, beforeBoundary);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {

@@ -66,6 +66,12 @@ export function resultPreview(text: string, chars: number): string {
 /** The marker every fast-jev truncation note starts with. */
 export const COMPACTION_NOTE_MARKER = '[fast-jev-compaction ';
 
+export function isCompactedResult(text: string, useId: string): boolean {
+  const notes = text.match(/(?:^|\n)\[fast-jev-compaction truncated \d+(?: of \d+)? chars[^\n]*\]/g) ?? [];
+  return notes.some((note) => note.includes(`tool_use_id=${useId};`) ||
+    /^\n?\[fast-jev-compaction truncated \d+ chars of this tool result(?: \(error\))?; re-run the tool if needed\]$/.test(note));
+}
+
 const READ_ONLY_TOOLS = new Set([
   'Read',
   'Grep',
@@ -157,7 +163,7 @@ export function collectToolCalls(
           isPinned(callIndex, messages.length, preserveRecentMessages) ||
           isPinned(found.index, messages.length, preserveRecentMessages),
         sideEffects: hasSideEffects(tool.tool),
-        compacted: found.result.text.includes(COMPACTION_NOTE_MARKER),
+        compacted: isCompactedResult(found.result.text, tool.tool_use_id),
       });
     }
   });
