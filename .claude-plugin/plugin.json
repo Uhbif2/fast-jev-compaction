@@ -1,6 +1,6 @@
 {
   "name": "fast-jev-compaction-local",
-  "version": "0.3.0-local.10",
+  "version": "0.3.0-local.11",
   "description": "Local hardened fast-jev compaction: Jev-only (never a Claude summary), conservative tool relevance scoring, result previews, sharded dialogue context, bounded retries.",
   "license": "MIT",
   "userConfig": {
@@ -40,6 +40,12 @@
       "description": "Estimated ceiling for per-batch Jev state. Dialogue text is never abridged; hard-clamped below Jev's 32k state+longest-question limit.",
       "default": 31000
     },
+    "maxJevRequests": {
+      "type": "number",
+      "title": "Jev requests per pass",
+      "description": "Soft request budget (16 by default). Largest eligible outputs are checked first; each candidate always gets full dialogue coverage. Remaining candidates stay unchanged for the next pass. One complete shard group may exceed this budget.",
+      "default": 16
+    },
     "maxRequestTokens": {
       "type": "number",
       "title": "Maximum Jev request tokens",
@@ -48,8 +54,8 @@
     },
     "truncateHeadChars": {
       "type": "number",
-      "title": "Truncated tool result head",
-      "description": "Characters of a tool result kept when Jev decides its full output is no longer needed; 0 keeps only the note.",
+      "title": "Truncated tool result head and tail",
+      "description": "Characters retained at EACH end of a shortened result; 0 keeps only its transcript pointer. Action records are retained for tools that may have side effects.",
       "default": 300
     },
     "model": {

@@ -16,7 +16,7 @@ Local marketplace в `~/.claude/settings.json` (`extraKnownMarketplaces`) и
 | option | value |
 |---|---:|
 | `compactAtPercent` | `30` |
-| `keepThreshold` | `0.01` |
+| `keepThreshold` | `0.5` |
 | `preserveRecentMessages` | `12` |
 | `minReductionRatio` | `0` |
 | `compactAssistantText` | `false` |
@@ -25,9 +25,11 @@ Local marketplace в `~/.claude/settings.json` (`extraKnownMarketplaces`) и
 | `resultPreviewChars` | default `1000` |
 | `truncateHeadChars` | default `300` |
 | `model` | `jev-latest` |
+| `maxJevRequests` | default `16` |
 
-`keepThreshold=0.01` намеренно консервативен: удалять следует только при практически нулевой
-вероятности релевантности.
+Профиль перечитан 22.09 при работе над local.11. Порог уже был 0.5; 0.01 в прежней документации
+было устаревшим значением. Вероятностная оценка Jev не является гарантией отсутствия потери смысла.
+Полные тексты user/assistant сохраняются; старые результаты доступны в исходных записях `.jsonl`.
 
 Вне плагина, в `~/.claude/settings.json` → `env`:
 
@@ -126,6 +128,30 @@ carried N tokens (before: M)». Это `usage` реального запроса
 - `postTokens` считает то, что вернул хук, даже когда до local.8 он возвращал исходные сообщения
   после ошибки (21.09: boundary «541k → 219k», а следующий запрос — 544k);
 - строка UI вроде `from 2.5k tokens` поэтому не доказывает, что весь контекст был 2.5k.
+
+## Реплей и живая проверка
+
+```text
+npx tsx scripts/replay.ts <transcript.jsonl> --baseline <installed-plugin-root>
+```
+
+Скрипт читает только цепочку выбранной сессии и выводит агрегаты; scorer фиктивный. Его
+`maximumReductionPercent` — потолок экономии при минимальных score, НЕ измерение качества Jev.
+`--before-boundary` проверяет цепочку перед последней компакцией.
+
+Живая проверка на полностью синтетическом разговоре:
+
+```text
+node scripts/smoke.mjs <bundled-claude.exe>
+```
+
+Она создаёт отдельный fork, запускает `/compact` установленным плагином и проверяет сохранность
+всех текстов, нужного результата и отсутствие Claude summary. Credentials читает только сам
+Claude. `--source` меняет identity на inline-plugin и потому может не получить sensitive apiKey;
+для сетевой приёмки использовать установленную версию. Настройки основной сессии не меняются.
+
+`deferred` в итоге означает кандидатов, оставленных на следующий проход ради ограничения времени.
+Повторный ручной `/compact` продвигает очередь; авто-компакция соблюдает обычный cooldown.
 
 ## Rollback
 

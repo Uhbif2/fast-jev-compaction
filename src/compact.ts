@@ -1,5 +1,11 @@
 import { noulAnswer } from './request.js';
-import { collectToolCalls, estimateTokens, fitBatchStates } from './state.js';
+import {
+  collectToolCalls,
+  COMPACTION_NOTE_MARKER,
+  estimateTokens,
+  fitBatchStates,
+  hasSideEffects,
+} from './state.js';
 import type {
   AssistantTextDecision,
   CallAnswer,
@@ -19,6 +25,8 @@ import type {
 } from './types.js';
 
 export const DEFAULT_OPTIONS: ResolvedCompactOptions = {
+  maxJevRequests: 16,
+  recentlyReviewedToolUseIds: [],
   goal: '',
   keepThreshold: 0.5,
   preserveRecentMessages: 6,
@@ -42,6 +50,8 @@ function finite(value: number | undefined, fallback: number): number {
 
 export function resolveOptions(options: CompactOptions = {}): ResolvedCompactOptions {
   return {
+    maxJevRequests: Math.max(1, Math.floor(finite(options.maxJevRequests, DEFAULT_OPTIONS.maxJevRequests))),
+    recentlyReviewedToolUseIds: options.recentlyReviewedToolUseIds ?? [],
     goal: options.goal ?? DEFAULT_OPTIONS.goal,
     keepThreshold: finite(options.keepThreshold, DEFAULT_OPTIONS.keepThreshold),
     preserveRecentMessages: Math.max(
@@ -71,7 +81,7 @@ export function resolveOptions(options: CompactOptions = {}): ResolvedCompactOpt
   };
 }
 
-function boundedInput(input: Record<string, unknown>, limit = 4_000): string {
+function boundedInput(input: Record<string, unknown>, limit = 1_000): string {
   let text: string;
   try {
     text = JSON.stringify(input);
@@ -81,37 +91,35 @@ function boundedInput(input: Record<string, unknown>, limit = 4_000): string {
   return text.length <= limit ? text : text.slice(0, limit - 1) + '…';
 }
 
+/** What later calls tell about this one, for the question. */
+function laterEvidence(call: ToolCall): Record<string, string> {
+  const evidence: Record<string, string> = {};
+  if (call.repeatedBy) evidence.same_target_called_again_by = call.repeatedBy;
+  if (call.targetChangedBy) evidence.file_modified_later_by = call.targetChangedBy;
+  return evidence;
+}
+
 /**
- * Two atomic Noul judgments. The proposition is informational relevance to a
- * correct continuation, not reproducibility and not a request to choose a
- * retention strategy.
+ * Atomic Noul judgments on informational relevance to a correct continuation,
+ * not on reproducibility or retention strategy. The criteria say what stays
+ * either way (the call record and a short head and tail of its output), so a
+ * probability measures the information that removing the rest would lose.
+ * A side-effecting call's record is never removed, so it gets only the
+ * result question.
  */
 export function questionsFor(call: ToolCall): JevQuestions {
   const targetCall = {
     id: call.id,
     tool: call.tool,
     input: boundedInput(call.input),
+    ...laterEvidence(call),
   };
-  return {
-    [`call_${call.id}`]: {
-      type: 'noul',
-      instructions: {
-        question:
-          'Does this historical tool-call record contain information relevant to correctly continuing the current conversation from its latest point?',
-        target_call: targetCall,
-      },
-      criteria: {
-        true:
-          'The fact that this action occurred, its target/input, its side effect or failure, or its relation to later turns is relevant to interpreting the current state, honoring any still-applicable user requirement established anywhere in the dialogue, choosing or avoiding a next action, verifying work, explaining what has been done, or diagnosing a problem.',
-        false:
-          'The fact of this call and its input are fully superseded, duplicated, or unrelated to the current state and every still-applicable user requirement; removing this call record leaves no relevant information for correctly continuing this same conversation.',
-      },
-    },
+  const questions: JevQuestions = {
     [`result_${call.id}`]: {
       type: 'noul',
       instructions: {
         question:
-          'Does the actual content of this historical tool result contain information relevant to correctly continuing the current conversation from its latest point?',
+          'Does this historical tool result contain information still needed to correctly continue this conversation at its latest point?',
         target_call: targetCall,
         result: {
           chars: call.resultChars,
@@ -121,11 +129,29 @@ export function questionsFor(call: ToolCall): JevQuestions {
       },
       criteria: {
         true:
-          'Some specific content in this result—such as a value, text, error, path, state observation, evidence, constraint, or confirmation—is relevant to interpreting the current state, honoring a still-applicable user requirement, choosing or verifying a next action, explaining prior work, or diagnosing a problem.',
+          'A specific value, identifier, error, observation, constraint or evidence is needed for unfinished work, an open question, a still-applicable user requirement, or understanding the current state, and later messages do not preserve it. Uncertainty about missing preview content is not evidence that it is irrelevant.',
         false:
-          'All informative content in this result is fully superseded, duplicated, or unrelated to the current state and every still-applicable user requirement; removing the result content leaves no relevant information for correctly continuing this same conversation.',
+          'The information is fully superseded, duplicated in later dialogue, or unrelated to continuation. A completed subtask or later read/edit is evidence to consider, not sufficient by itself: no unique detail from this output is still needed.',
       },
     },
+  };
+  if (call.sideEffects) return questions;
+  return {
+    [`call_${call.id}`]: {
+      type: 'noul',
+      instructions: {
+        question:
+          'Is the record that this historical lookup happened (tool, target, input) still needed to correctly continue the current conversation from its latest point?',
+        target_call: targetCall,
+      },
+      criteria: {
+        true:
+          'Later reasoning relies on this lookup having been done on this target, or its target is still being worked on and nothing later covers it, so forgetting it would mislead the continuation or cause the same lookup to be repeated needlessly.',
+        false:
+          'The lookup no longer matters: its target was looked up again or changed later, it belongs to a finished subtask, or its outcome is fully stated in later messages.',
+      },
+    },
+    ...questions,
   };
 }
 
@@ -287,7 +313,7 @@ export function batchCalls(
 }
 
 export function decideCall(
-  call: Pick<ToolCall, 'id' | 'tool' | 'pinned'>,
+  call: Pick<ToolCall, 'id' | 'tool' | 'pinned'> & Partial<Pick<ToolCall, 'sideEffects'>>,
   answer: CallAnswer,
   options: Pick<ResolvedCompactOptions, 'keepThreshold'>,
 ): CallDecision {
@@ -296,7 +322,9 @@ export function decideCall(
   if (answer.keepResult >= options.keepThreshold) {
     return { ...base, action: 'keep', reason: 'kept' };
   }
-  if (answer.keepCall >= options.keepThreshold) {
+  // A call that may have changed the world keeps its record: without it the
+  // continuation cannot know the change happened (and may repeat it).
+  if (call.sideEffects || answer.keepCall >= options.keepThreshold) {
     return { ...base, action: 'drop_result', reason: 'result_dropped' };
   }
   return { ...base, action: 'drop_call', reason: 'call_dropped' };
@@ -326,7 +354,7 @@ async function askBatch(
       batch.map((call) => [
         call.id,
         {
-          keepCall: noulAnswer(answers, `call_${call.id}`),
+          keepCall: call.sideEffects ? 1 : noulAnswer(answers, `call_${call.id}`),
           keepResult: noulAnswer(answers, `result_${call.id}`),
         },
       ]),
@@ -415,12 +443,54 @@ function planBatches(
   }));
 }
 
-function truncatedResultText(text: string, isError: boolean, headChars: number): string {
-  if (text.length <= headChars + 120) return text;
-  const head = headChars > 0 ? `${text.slice(0, headChars)}\n` : '';
-  return `${head}[fast-jev-compaction truncated ${text.length - headChars} chars of this tool result${
-    isError ? ' (error)' : ''
-  }; re-run the tool if needed]`;
+/**
+ * A shortened result: head and tail of the output around a note. The note
+ * points to the original (the session transcript keeps it) instead of
+ * suggesting a re-run, which for a side-effecting call would repeat its effect.
+ */
+export function truncatedResultText(
+  text: string,
+  isError: boolean,
+  keepChars: number,
+  call: Pick<ToolCall, 'tool' | 'tool_use_id' | 'sideEffects'>,
+): string {
+  const head = Math.max(0, keepChars);
+  const tail = Math.max(0, keepChars);
+  if (text.length <= head + tail + 200) return text;
+  const cut = text.length - head - tail;
+  const advice = call.sideEffects
+    ? 'do not re-run the call just to see its output: that may repeat its side effect'
+    : 'look it up again if the details are needed';
+  const note =
+    `${COMPACTION_NOTE_MARKER}truncated ${cut} of ${text.length} chars of this ${call.tool} result` +
+    `${isError ? ' (error)' : ''}; the original is in this session's transcript (.jsonl), ` +
+    `tool_use_id=${call.tool_use_id}; ${advice}]`;
+  const shortened = [head > 0 ? text.slice(0, head) : '', note, tail > 0 ? text.slice(-tail) : '']
+    .filter(Boolean)
+    .join('\n');
+  return shortened.length < text.length ? shortened : text;
+}
+
+/** Below this many characters a removable call is not worth a Jev question. */
+const MIN_SAVING_CHARS = 400;
+
+/**
+ * The calls worth asking Jev about: not pinned, not already shortened, and
+ * with something to gain. A side-effecting call can only lose its result
+ * body, so a short result leaves nothing to gain; a lookup can also lose its
+ * record, which pays only when record and result are not tiny.
+ */
+export function compactionCandidates(
+  calls: readonly ToolCall[],
+  options: Pick<ResolvedCompactOptions, 'truncateHeadChars'>,
+): ToolCall[] {
+  const keep = Math.max(0, options.truncateHeadChars) * 2 + 200;
+  return calls.filter((call) => {
+    if (call.pinned || call.compacted) return false;
+    const shortenable = call.resultChars > keep + MIN_SAVING_CHARS / 2;
+    if (call.sideEffects) return shortenable;
+    return shortenable || call.resultChars + boundedInput(call.input).length >= MIN_SAVING_CHARS;
+  });
 }
 
 /**
@@ -437,6 +507,14 @@ export function applyDecisions(
   dropAssistantTextIndices: ReadonlySet<number> = new Set<number>(),
 ): Message[] {
   const byId = new Map(calls.map((call) => [call.id, call]));
+  const byUseId = new Map(calls.map((call) => [call.tool_use_id, call]));
+  const shorten = (text: string, isError: boolean, useId: string, tool: string): string =>
+    truncatedResultText(
+      text,
+      isError,
+      headChars,
+      byUseId.get(useId) ?? { tool, tool_use_id: useId, sideEffects: hasSideEffects(tool) },
+    );
   const actions = new Map<string, CallDecision['action']>();
   for (const decision of decisions) {
     const call = byId.get(decision.id);
@@ -459,11 +537,7 @@ export function applyDecisions(
       .filter((tool) => actions.get(tool.tool_use_id) !== 'drop_call')
       .map((tool) => {
         if (actions.get(tool.tool_use_id) !== 'drop_result') return tool;
-        const text = truncatedResultText(
-          tool.text ?? '',
-          tool.isError ?? false,
-          headChars,
-        );
+        const text = shorten(tool.text ?? '', tool.isError ?? false, tool.tool_use_id, tool.tool);
         if ((tool.text ?? '') === text) return tool;
         const copy: ToolUse = {
           tool_use_id: tool.tool_use_id,
@@ -478,7 +552,12 @@ export function applyDecisions(
       .filter((result) => actions.get(result.tool_use_id) !== 'drop_call')
       .map((result) => {
         if (actions.get(result.tool_use_id) !== 'drop_result') return result;
-        const text = truncatedResultText(result.text, result.isError ?? false, headChars);
+        const text = shorten(
+          result.text,
+          result.isError ?? false,
+          result.tool_use_id,
+          byUseId.get(result.tool_use_id)?.tool ?? 'tool',
+        );
         return text === result.text
           ? result
           : {
@@ -557,7 +636,10 @@ export async function compact(
     resolved.preserveRecentMessages,
     resolved.resultPreviewChars,
   );
-  const toolCandidates = calls.filter((call) => !call.pinned);
+  const reviewed = new Set(resolved.recentlyReviewedToolUseIds);
+  const potential = (call: ToolCall): number => call.resultChars + (call.sideEffects ? 0 : JSON.stringify(call.input).length);
+  const toolCandidates = compactionCandidates(calls, resolved).sort((a, b) =>
+    Number(reviewed.has(a.tool_use_id)) - Number(reviewed.has(b.tool_use_id)) || potential(b) - potential(a));
   const assistantCandidates = resolved.compactAssistantText
     ? assistantTextCandidateIndices(messages, resolved.preserveRecentMessages)
     : [];
@@ -602,7 +684,16 @@ export async function compact(
       .map((entry) => entry.i);
 
   if (toolCandidates.length > 0) {
-    const plans = planBatches(messages, calls, toolCandidates, resolved);
+    const allPlans = planBatches(messages, calls, toolCandidates, resolved);
+    const plans: BatchPlan[] = [];
+    let budget = 0;
+    for (const plan of allPlans) {
+      // A partial shard group must never authorize removal. At least one
+      // complete group is processed, even if its coverage exceeds the soft cap.
+      if (plans.length > 0 && budget + plan.states.length > resolved.maxJevRequests) break;
+      plans.push(plan);
+      budget += plan.states.length;
+    }
     // Assistant-text questions, when enabled, may add requests to this count.
     plannedRequests = plans.reduce((sum, plan) => sum + plan.states.length, 0);
     observer.planned?.(plannedRequests);
@@ -687,6 +778,13 @@ export async function compact(
   const decisions = calls.map((call) =>
     decideCall(call, answers.get(call.id) ?? { keepCall: 1, keepResult: 1 }, resolved),
   );
+  const resultScores: CompactResult['stats']['resultScores'] = [0, 0, 0, 0, 0];
+  for (const call of toolCandidates) {
+    const score = answers.get(call.id)?.keepResult;
+    if (score === undefined) continue;
+    const bucket = score < 0.1 ? 0 : score < 0.3 ? 1 : score < 0.5 ? 2 : score < 0.9 ? 3 : 4;
+    resultScores[bucket] += 1;
+  }
   const assistantTextDecisions: AssistantTextDecision[] = assistantCandidates.map((index) => {
     const keep = assistantScores.get(index) ?? 1;
     return keep >= resolved.keepThreshold
@@ -706,6 +804,7 @@ export async function compact(
     dropAssistantTextIndices,
   );
   return {
+    reviewedToolUseIds: toolCandidates.filter((call) => answers.has(call.id)).map((call) => call.tool_use_id),
     messages: kept,
     decisions,
     assistantTextDecisions,
@@ -722,6 +821,9 @@ export async function compact(
       assistantTexts: assistantTextDecisions.length,
       assistantTextsKept: assistantTextDecisions.filter((d) => d.action === 'keep').length,
       assistantTextsDropped: assistantTextDecisions.filter((d) => d.action === 'drop_text').length,
+      asked: answers.size,
+      deferred: toolCandidates.length - answers.size,
+      resultScores,
       stateTokens: maxStateTokens,
       stateStage:
         requestCount > 0
