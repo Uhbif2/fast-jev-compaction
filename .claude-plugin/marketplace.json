@@ -1,0 +1,15 @@
+{
+  "name": "fast-jev-compaction-local",
+  "owner": {
+    "name": "local"
+  },
+  "plugins": [
+    {
+      "name": "fast-jev-compaction-local",
+      "source": "./",
+      "description": "Local hardened fast-jev compaction: Jev-only safe mode, conservative tool relevance scoring, result previews, sharded dialogue context, retries, and durable diagnostics.",
+      "version": "0.3.0-local.7",
+      "license": "MIT"
+    }
+  ]
+}
