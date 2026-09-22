@@ -36,6 +36,13 @@ Local marketplace в `~/.claude/settings.json` (`extraKnownMarketplaces`) и
   Автоматически сжимает только плагин (`turn.complete`). `DISABLE_COMPACT` не ставить: он
   выключает и `/compact`, и `$.session.compact()` плагина.
 
+И в `hooks` того же файла — выключатель встроенного саммари, классический `PreCompact`:
+`node "C:/MCPs/fast-jev-compaction-local/guard/block-builtin-compact.mjs"` (timeout 10). Он
+живёт в settings, а не в плагине, чтобы работать и тогда, когда плагин не загрузился. **Путь к
+нему — потребитель пути компонента:** при переезде папки поправить эту строку.
+Проверка без затрат: безголовый `claude -p … --settings '{"enabledPlugins":{"fast-jev-compaction-local@fast-jev-compaction-local":false}}' --resume <id> "/compact"`
+должен ответить `Compaction blocked by PreCompact hook`.
+
 ## Перенос в C:\MCPs (22.09.2026)
 
 Сделано: папка перенесена владельцем; `git init`, базовый коммит и тег `v0.3.0-local.7`;
@@ -74,8 +81,8 @@ marketplace перепривязан (резервные копии обоих �
 6. `claude plugin marketplace update fast-jev-compaction-local`
 7. `claude plugin update fast-jev-compaction-local@fast-jev-compaction-local`
 8. Проверить settings: профиль выше должен сохраниться.
-9. `/reload-plugins --force` допустим как первая попытка, но не считать его доказательством.
-   Preflight toast должен показывать новый `LOCAL_BUILD`.
+9. Не полагаться на `/reload-plugins`: 22.09 после него рантайм оставался на старой версии.
+   Версию процесса видно в `…/<версия>/.in_use/<pid>`, toast показывает `LOCAL_BUILD`.
 10. Если runtime держит старый hook — переоткрыть только Code-сессию/создать новый Code runtime,
     не перезапускать Claude Desktop целиком.
 11. Выполнить `/compact` на безопасной сессии и проверить, что built-in summary не появился.

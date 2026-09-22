@@ -379,8 +379,15 @@ function planBatches(
   if (stateLimit < 1) {
     throw new Error('a Jev question is too large to leave room for conversation state');
   }
-  const layout = fitBatchStates(messages, calls, candidates, options, stateLimit);
-  const stateTokens = Math.max(...layout.map((state) => state.tokens));
+  // `evaluating` is reserved rather than laid out: fitted with every candidate
+  // id, the layout's soft 75% base target would drop the tool index for the
+  // sake of a list no single request carries.
+  const evaluatingReserve = estimateTokens(JSON.stringify(candidates.map((call) => call.id)));
+  if (stateLimit - evaluatingReserve < 1) {
+    throw new Error('too many Jev candidates to list in one state');
+  }
+  const layout = fitBatchStates(messages, calls, [], options, stateLimit - evaluatingReserve);
+  const stateTokens = Math.max(...layout.map((state) => state.tokens)) + evaluatingReserve;
   if (stateTokens + longest + REQUEST_OVERHEAD_TOKENS > JEV_STATE_PLUS_LONGEST_QUESTION_TOKENS) {
     throw new Error('batch shard exceeds Jev 32k state+longest-question limit');
   }
