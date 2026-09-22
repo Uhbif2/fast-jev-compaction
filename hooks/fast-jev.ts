@@ -2,6 +2,7 @@ import type {
   On,
   PluginOptions,
   Register,
+  SessionCompactResult,
   SessionMessage,
   ToolResultSummary,
   ToolUseSummary,
@@ -9,7 +10,7 @@ import type {
 } from 'claude-code';
 
 import { assistantTextCandidateIndices, compact, reductionRatio, resolveOptions } from '../src/compact.js';
-import { collectToolCalls } from '../src/state.js';
+import { collectToolCalls, goalFromMessages } from '../src/state.js';
 import { buildJevRequest, DEFAULT_MODEL, parseJevResponse } from '../src/request.js';
 declare const setTimeout: (handler: () => void, timeoutMs: number) => unknown;
 
@@ -39,16 +40,25 @@ export type HookFetchResponse = {
   status: number;
   ok: boolean;
   text: string;
+  headers?: Record<string, string>;
 };
 
 /** The shape of `$.http.fetch`, so the hook can be driven without an engine. */
 export type HookFetch = (url: string, init?: HookFetchInit) => Promise<HookFetchResponse>;
 
-const LOCAL_BUILD = '0.3.0-local.7';
-function diagnostic(_event: string, _fields: Record<string, unknown> = {}): void {}
+/** Waits between retries; the hook passes `$.clock.sleep`, tests pass an instant one. */
+export type HookSleep = (ms: number) => Promise<void>;
 
-const JEV_MAX_ATTEMPTS = 10;
-const JEV_RETRY_DELAYS_MS = [1_000, 2_000, 4_000, 8_000, 15_000, 30_000, 30_000, 30_000, 30_000];
+export const LOCAL_BUILD = '0.3.0-local.8';
+
+export const JEV_MAX_ATTEMPTS = 6;
+const JEV_RETRY_DELAYS_MS = [1_000, 2_000, 4_000, 8_000, 15_000];
+/** Longest wait a Retry-After header may ask for. */
+const JEV_MAX_RETRY_AFTER_MS = 30_000;
+/** Wall-clock budget for all Jev requests of one compaction, retries included. */
+export const JEV_TOTAL_BUDGET_MS = 150_000;
+/** After an auto-compaction attempt, the next one waits until the context grows this share of the window. */
+const AUTO_RECOMPACT_GROWTH = 0.1;
 
 export type JevTransportStats = {
   batches: number;
@@ -68,8 +78,18 @@ function retryableStatus(status: number): boolean {
   return status === 429 || (status >= 500 && status <= 599);
 }
 
-function sleep(ms: number): Promise<void> {
+function timerSleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Retry-After in seconds or as an HTTP date, capped; undefined when absent or unreadable. */
+export function retryAfterMs(headers: Record<string, string> | undefined, now = Date.now()): number | undefined {
+  const value = headers?.['retry-after'];
+  if (!value) return undefined;
+  const seconds = Number(value);
+  const ms = Number.isFinite(seconds) ? seconds * 1_000 : Date.parse(value) - now;
+  if (!Number.isFinite(ms) || ms < 0) return undefined;
+  return Math.min(ms, JEV_MAX_RETRY_AFTER_MS);
 }
 
 export type HookConfig = CompactOptions & {
@@ -125,15 +145,22 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
   return config;
 }
 
-/** A `JevAsker` over the engine's `$.http.fetch`. */
+/**
+ * A `JevAsker` over the engine's `$.http.fetch`. Transport errors, 429 and 5xx
+ * are retried (honouring Retry-After); every request of one compaction shares
+ * one wall-clock budget, so a Jev outage cannot hold the session for minutes.
+ */
 export function jevAsker(
   fetchFn: HookFetch,
   apiKey: string,
   model: string,
   log: (text: string) => void = () => {},
   transport: JevTransportStats = emptyTransportStats(),
+  sleep: HookSleep = timerSleep,
+  budgetMs: number = JEV_TOTAL_BUDGET_MS,
 ): JevAsker {
   let batchNumber = 0;
+  const deadline = Date.now() + budgetMs;
   return {
     async ask(state, questions) {
       const request = buildJevRequest({ apiKey, model }, state, questions);
@@ -141,59 +168,49 @@ export function jevAsker(
       transport.batches += 1;
 
       for (let attempt = 1; attempt <= JEV_MAX_ATTEMPTS; attempt += 1) {
+        const label = `Jev batch ${batch} attempt ${attempt}/${JEV_MAX_ATTEMPTS}`;
         const started = Date.now();
         transport.attempts += 1;
-        diagnostic('jev_http_start', { batch, attempt, maxAttempts: JEV_MAX_ATTEMPTS, questions: Object.keys(questions).length });
-        log('Jev batch ' + batch + ' attempt ' + attempt + '/' + JEV_MAX_ATTEMPTS + ': started');
+        log(`${label}: started`);
 
-        let response: HookFetchResponse;
+        let failure: string;
+        let retryAfter: number | undefined;
         try {
-          response = await fetchFn(request.url, {
+          const response = await fetchFn(request.url, {
             method: request.method,
             headers: request.headers,
             body: request.body,
           });
-        } catch (error) {
           const elapsed = Date.now() - started;
-          const message = error instanceof Error ? error.message : String(error);
-          diagnostic('jev_transport_error', { batch, attempt, elapsedMs: elapsed, final: attempt >= JEV_MAX_ATTEMPTS, error: message });
-          if (attempt >= JEV_MAX_ATTEMPTS) {
-            log('Jev batch ' + batch + ' attempt ' + attempt + '/' + JEV_MAX_ATTEMPTS + ': transport error after ' + elapsed + 'ms; giving up (' + message + ')');
-            throw error;
+          if (response.ok || !retryableStatus(response.status)) {
+            // Success, or a permanent error (4xx, malformed body): no retry.
+            const parsed = parseJevResponse(response.status, response.ok, response.text);
+            log(`${label}: HTTP ${response.status}, success in ${elapsed}ms`);
+            return parsed;
           }
-          const delay = JEV_RETRY_DELAYS_MS[attempt - 1] ?? 30_000;
-          transport.retries += 1;
-          log('Jev batch ' + batch + ' attempt ' + attempt + '/' + JEV_MAX_ATTEMPTS + ': transport error after ' + elapsed + 'ms; retry in ' + delay + 'ms (' + message + ')');
-          await sleep(delay);
-          continue;
-        }
-
-        const elapsed = Date.now() - started;
-        diagnostic('jev_http_response', { batch, attempt, status: response.status, ok: response.ok, elapsedMs: elapsed });
-        if (!response.ok && retryableStatus(response.status)) {
-          const error = new Error('Jev request failed (' + response.status + '): ' + response.text.slice(0, 200));
+          failure = `HTTP ${response.status} after ${elapsed}ms`;
+          retryAfter = retryAfterMs(response.headers);
           if (attempt >= JEV_MAX_ATTEMPTS) {
-            log('Jev batch ' + batch + ' attempt ' + attempt + '/' + JEV_MAX_ATTEMPTS + ': HTTP ' + response.status + ' after ' + elapsed + 'ms; giving up');
-            throw error;
+            throw new Error(`Jev request failed (${response.status}): ${response.text.slice(0, 200)}`);
           }
-          const delay = JEV_RETRY_DELAYS_MS[attempt - 1] ?? 30_000;
-          transport.retries += 1;
-          log('Jev batch ' + batch + ' attempt ' + attempt + '/' + JEV_MAX_ATTEMPTS + ': HTTP ' + response.status + ' after ' + elapsed + 'ms; retry in ' + delay + 'ms');
-          await sleep(delay);
-          continue;
-        }
-
-        try {
-          const parsed = parseJevResponse(response.status, response.ok, response.text);
-          diagnostic('jev_parse_success', { batch, attempt, status: response.status, elapsedMs: elapsed });
-          log('Jev batch ' + batch + ' attempt ' + attempt + '/' + JEV_MAX_ATTEMPTS + ': HTTP ' + response.status + ', success in ' + elapsed + 'ms');
-          return parsed;
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
-          diagnostic('jev_parse_error', { batch, attempt, status: response.status, elapsedMs: elapsed, error: message });
-          log('Jev batch ' + batch + ' attempt ' + attempt + '/' + JEV_MAX_ATTEMPTS + ': permanent response error after ' + elapsed + 'ms (' + message + ')');
-          throw error;
+          const transportError = !/^Jev (request failed|returned|response)|^Invalid Jev/.test(message);
+          if (!transportError || attempt >= JEV_MAX_ATTEMPTS) {
+            log(`${label}: giving up (${message})`);
+            throw error;
+          }
+          failure = `transport error after ${Date.now() - started}ms (${message})`;
         }
+
+        const delay = retryAfter ?? JEV_RETRY_DELAYS_MS[attempt - 1] ?? JEV_MAX_RETRY_AFTER_MS;
+        if (Date.now() + delay > deadline) {
+          log(`${label}: ${failure}; no time left in the ${budgetMs}ms budget`);
+          throw new Error(`Jev unavailable: ${failure}; retry budget of ${Math.round(budgetMs / 1000)}s exhausted`);
+        }
+        transport.retries += 1;
+        log(`${label}: ${failure}; retry in ${delay}ms`);
+        await sleep(delay);
       }
 
       throw new Error('Jev retry loop exhausted unexpectedly');
@@ -267,10 +284,23 @@ export async function compactSession(
   fetchFn: HookFetch,
   log: (text: string) => void = () => {},
   transport: JevTransportStats = emptyTransportStats(),
+  sleep: HookSleep = timerSleep,
 ): Promise<SessionCompaction> {
   if (!config.apiKey) throw new Error('TYPESAFE_API_KEY is not configured');
-  const result = await compact(messages, jevAsker(fetchFn, config.apiKey, config.model, log, transport), config);
+  const asker = jevAsker(fetchFn, config.apiKey, config.model, log, transport, sleep);
+  const result = await compact(messages, asker, config);
   return { result, messages: toSessionMessages(messages, result.messages) };
+}
+
+/** `/compact <text>` steers Jev on top of the default goal (the latest user prompts). */
+export function compactionGoal(
+  messages: readonly SessionMessage[],
+  config: Pick<HookConfig, 'goal'>,
+  instructions?: string,
+): string | undefined {
+  const extra = instructions?.trim();
+  if (!extra) return config.goal;
+  return `${extra}\n${config.goal || goalFromMessages(messages)}`;
 }
 
 function percent(ratio: number): string {
@@ -346,30 +376,44 @@ async function getApiKey(
   return undefined;
 }
 
-function notify(
-  $: {
-    ui: {
-      log: (text: string) => void;
-      toast: (text: string, options?: { timeoutMs?: number }) => void;
-    };
-  },
-  text: string,
-): void {
-  $.ui.log(text);
-  $.ui.toast(text, { timeoutMs: 15_000 });
+type NotifyTarget = {
+  ui: {
+    log: (text: string) => void;
+    toast: (text: string, options?: { timeoutMs?: number }) => void;
+  };
+};
+
+/** Log and toast; never throws, so a failing UI cannot turn into a failing compaction. */
+function notify($: NotifyTarget, text: string): void {
+  try {
+    $.ui.log(text);
+    $.ui.toast(text, { timeoutMs: 15_000 });
+  } catch {
+    // The hook's answer matters more than the notice.
+  }
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function tokensText(tokens: number): string {
+  return tokens >= 1_000 ? `${Math.round(tokens / 1_000)}k` : String(tokens);
 }
 
 export const register: Register = (on: On, options: PluginOptions) => {
   const configured = resolveHookConfig(options);
-  diagnostic('register', {
-    keepThreshold: configured.keepThreshold,
-    preserveRecentMessages: configured.preserveRecentMessages,
-    compactAtPercent: configured.compactAtPercent,
-    minReductionRatio: configured.minReductionRatio,
-  });
   let compacting = false;
+  /** Context size when auto-compaction last ran; the next run waits for real growth. */
+  let lastAutoTokens: number | undefined;
+  /** Context size before the last compaction that stood, to report its real effect. */
+  let effectPending: number | undefined;
+  let lastAutoError = '';
 
-  on('session.compact', async ($, event, next) => {
+  // Never `next(event)`: that is the engine's own Claude summary. Whatever goes
+  // wrong, the hook answers itself: the compacted messages or `{ skip }`.
+  on('session.compact', async ($, event, _next): Promise<SessionCompactResult> => {
+    const tag = `fast-jev ${LOCAL_BUILD} [${event.trigger}${event.agentId ? ', subagent' : ''}]`;
     const transport = emptyTransportStats();
     try {
       const resolvedPreflight = resolveOptions(configured);
@@ -383,94 +427,99 @@ export const register: Register = (on: On, options: PluginOptions) => {
       const assistantEligible = resolvedPreflight.compactAssistantText
         ? assistantTextCandidateIndices(event.messages, resolvedPreflight.preserveRecentMessages).length
         : 0;
-      diagnostic('preflight', { eligible, pinned, assistantEligible, total: preflightCalls.length, messages: event.messages.length });
-      notify(
-        $,
-        `fast-jev ${LOCAL_BUILD} preflight: ${eligible} tool pair(s), ${assistantEligible} assistant text(s), ${pinned} pinned tool pair(s)`,
-      );
       if (eligible === 0 && assistantEligible === 0) {
-        diagnostic('no_op_zero_eligible');
-        notify($, `fast-jev ${LOCAL_BUILD}: no eligible tool content; no-op, no Jev request, no Claude fallback`);
-        return { messages: [...event.messages] };
+        const reason = `${tag}: nothing eligible (${pinned} pinned tool pair(s)); session unchanged, no Jev request`;
+        notify($, reason);
+        return { skip: reason };
       }
 
-      diagnostic('jev_only_start', { eligible, assistantEligible, pinned });
-      notify($, `fast-jev ${LOCAL_BUILD}: Jev-only compaction started for ${eligible} tool pair(s) and ${assistantEligible} assistant text(s); Claude fallback disabled`);
-      const config = { ...configured, apiKey: await getApiKey($, configured) };
+      notify(
+        $,
+        `${tag}: Jev compaction of ${eligible} tool pair(s)` +
+          (assistantEligible > 0 ? ` and ${assistantEligible} assistant text(s)` : '') +
+          `, ${pinned} pinned`,
+      );
+      const config: HookConfig = {
+        ...configured,
+        apiKey: await getApiKey($, configured),
+      };
+      const goal = compactionGoal(event.messages, configured, event.instructions);
+      if (goal) config.goal = goal;
       const { result, messages } = await compactSession(
         event.messages,
         config,
         async (url, init) => {
           const response = await $.http.fetch(url, init);
-          return { status: response.status, ok: response.ok, text: response.text };
+          return { status: response.status, ok: response.ok, text: response.text, headers: response.headers };
         },
         (line) => $.ui.log(line),
         transport,
+        (ms) => $.clock.sleep(ms),
       );
       for (const line of decisionLogLines(result)) $.ui.log(line);
-      // A transcript with no non-pinned tool pairs is a valid Jev no-op, not a
-      // compaction failure. Falling through to Claude summary here would spend
-      // Anthropic quota even though there is nothing Jev is allowed to prune.
-      if (result.stats.requests === 0) {
-        diagnostic('no_op_zero_requests', { reductionRatio: reductionRatio(result) });
-        notify(
-          $,
-          `no eligible tool content to prune; kept session unchanged, no summary (${summarize(result)}; ${transportSummary(transport)})`,
-        );
-        return { messages };
+      if (result.stats.requests === 0 || reductionRatio(result) <= 0) {
+        const reason = `${tag}: Jev kept everything; session unchanged (${summarize(result)})`;
+        notify($, reason);
+        return { skip: reason };
       }
       if (reductionRatio(result) < config.minReductionRatio) {
-        diagnostic('low_reduction_no_claude_fallback', {
-          reductionRatio: reductionRatio(result),
-          minReductionRatio: config.minReductionRatio,
-          requests: result.stats.requests,
-        });
-        notify(
-          $,
-          `Jev reduction below ${percent(config.minReductionRatio)} minimum; session left unchanged, Claude fallback disabled (${summarize(result)})`,
-        );
-        return { messages: [...event.messages] };
+        const reason = `${tag}: reduction below the ${percent(config.minReductionRatio)} minimum; session unchanged (${summarize(result)})`;
+        notify($, reason);
+        return { skip: reason };
       }
-      diagnostic('jev_compaction_success', {
-        messagesBefore: event.messages.length,
-        messagesAfter: messages.length,
-        reductionRatio: reductionRatio(result),
-        requests: result.stats.requests,
-        transport,
-      });
       notify(
         $,
-        `kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(result)})`,
+        `${tag}: kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(result)}; ${transportSummary(transport)})`,
       );
       return { messages };
     } catch (error) {
-      diagnostic('jev_error_no_claude_fallback', {
-        error: error instanceof Error ? error.message : String(error),
-        transport,
-      });
-      notify(
-        $,
-        `Jev compaction failed; session unchanged, Claude fallback disabled (${error instanceof Error ? error.message : String(error)})`,
-      );
-      return { messages: [...event.messages] };
+      const reason = `${tag}: Jev compaction failed, session unchanged, no Claude summary (${errorText(error)})`;
+      notify($, reason);
+      return { skip: reason };
     }
   });
 
+  // Auto-compaction through Jev. The engine's own auto-compact (a Claude
+  // summary) is meant to be off: DISABLE_AUTO_COMPACT=1. The call goes after
+  // `next(event)`: until core has closed the turn, `$.session.compact()` rejects
+  // with "a turn is running". Subagent turns never trigger it.
   on('turn.complete', async ($, event: TurnCompleteInput, next) => {
-    if (compacting) return next(event);
+    const answer = await next(event);
+    if (compacting || event.agentId !== undefined) return answer;
     try {
       const { context } = await $.session.usage();
-      if ((context.percent ?? 0) < configured.compactAtPercent) return next(event);
+      if (context.tokens === undefined || context.percent === undefined) return answer;
+      if (effectPending !== undefined) {
+        notify(
+          $,
+          `fast-jev ${LOCAL_BUILD}: first request after compaction carried ${tokensText(context.tokens)} tokens (before: ${tokensText(effectPending)})`,
+        );
+        effectPending = undefined;
+      }
+      if (context.percent < configured.compactAtPercent) return answer;
+      if (
+        lastAutoTokens !== undefined &&
+        context.tokens < lastAutoTokens + context.window * AUTO_RECOMPACT_GROWTH
+      ) {
+        return answer;
+      }
       compacting = true;
-      await $.session.compact();
-    } catch (error) {
       $.ui.log(
-        `auto-compact skipped (${error instanceof Error ? error.message : String(error)})`,
+        `fast-jev ${LOCAL_BUILD}: context ${context.percent}% >= ${configured.compactAtPercent}%, auto-compacting`,
       );
+      const outcome = await $.session.compact();
+      lastAutoTokens = context.tokens;
+      lastAutoError = '';
+      if (outcome.messages) effectPending = context.tokens;
+    } catch (error) {
+      const text = errorText(error);
+      if (text !== lastAutoError) notify($, `fast-jev ${LOCAL_BUILD}: auto-compact did not run (${text})`);
+      else $.ui.log(`fast-jev ${LOCAL_BUILD}: auto-compact did not run (${text})`);
+      lastAutoError = text;
     } finally {
       compacting = false;
     }
-    return next(event);
+    return answer;
   });
 };
 

@@ -1,14 +1,15 @@
 # Durable context — fast-jev-compaction-local
 
-Обновлено: 21.09.2026.
+Обновлено: 22.09.2026.
 
 ## Идентичность
 
 - Upstream: tamaratran/fast-jev-compaction 0.3.0.
 - Local plugin: fast-jev-compaction-local@fast-jev-compaction-local.
 - Upstream установлен отдельно и disabled.
-- Текущий local release: 0.3.0-local.7.
-- После миграции единственный рабочий исходник: <repo>.
+- Текущий local release: 0.3.0-local.8.
+- Единственный рабочий исходник: `<repo>` (свой git с 22.09.2026;
+  базовая точка — тег `v0.3.0-local.7`). Local marketplace указывает сюда.
 
 ## Зачем fork
 
@@ -24,15 +25,20 @@ head/tail preview.
 - длинная история покрывается evidence shards;
 - для target итоговый keep score = MAX по shards;
 - Jev requests выполняются последовательно;
-- transport/429/5xx имеют retry, permanent errors — нет;
-- built-in Claude summary fallback отключён: при ошибке Jev история остаётся неизменной.
+- transport/429/5xx имеют retry (с учётом Retry-After, общий бюджет 150 s на компакцию),
+  permanent errors — нет;
+- **встроенное саммари Claude не запускается никогда.** Хук `session.compact` не вызывает
+  `next(event)`: он отвечает сам — сжатыми сообщениями или `{ skip }`, в том числе при ошибке
+  Jev, no-op и малом сокращении. Автокомпакция движка (это Claude summary) выключена
+  `DISABLE_AUTO_COMPACT=1` в `~/.claude/settings.json` → `env`; автоматически сжимает только
+  сам плагин из `turn.complete`.
 
 Planner рассчитан на два физических ограничения Jev: 64k total request и 32k state + longest
 question. Поэтому большой разговор покрывается несколькими запросами, а не одним oversized state.
 
 ## Рабочий профиль
 
-compactAtPercent=20
+compactAtPercent=30
 keepThreshold=0.01
 preserveRecentMessages=12
 minReductionRatio=0
@@ -44,14 +50,28 @@ resultPreviewChars=1000
 truncateHeadChars=300
 model=jev-latest
 
+## Автокомпакция
+
+`turn.complete` зовёт `$.session.compact()` (trigger `plugin`) **после** `await next(event)`:
+движок отвергает вызов, пока ход не закрыт ядром («a turn is running … call it from
+turn.complete or later»). До 0.3.0-local.8 вызов стоял до `next(event)` — по транскриптам с
+20.09 не было ни одной компакции с trigger `plugin`/`auto`, все 11 — `manual`. Хук при вызове
+из плагина пропускает только вызывающий хук (`turn.complete`), а `session.compact` того же
+плагина событие видит, так что Jev-хук при этом работает.
+
+Повтор не раньше, чем контекст вырастет на 10% окна от прошлой попытки: иначе контекст, который
+Jev оставил выше порога, запускал бы компакцию на каждом ходу. Субагентские ходы автокомпакцию
+не запускают. Отказ вызова показывается toast'ом один раз, дальше — в `ui.log`.
+
 ## Claude Code
 
 Function hooks требуют >=2.1.274; при разработке проверена bundled 2.1.275 в Claude Desktop.
-Отдельная PATH-версия ранее была старее и не должна использоваться для диагностики Desktop hook.
+Отдельная PATH-версия (2.1.212) старее и не должна использоваться для диагностики Desktop hook.
 
 После plugin update живой Code runtime может удерживать старый versioned hook даже после
-/reload-plugins. Проверять LOCAL_BUILD в preflight toast. Если marker старый — открыть новый
-Code runtime/переоткрыть Code-чат, не перезапуская весь Desktop без необходимости.
+/reload-plugins. Проверять LOCAL_BUILD в toast (`fast-jev 0.3.0-local.8 [trigger]`). Если
+marker старый — открыть новый Code runtime/переоткрыть Code-чат, не перезапуская весь Desktop
+без необходимости.
 
 ## Проверенные наблюдения
 
@@ -60,13 +80,24 @@ Code runtime/переоткрыть Code-чат, не перезапуская �
 После sharding один /compact может занимать 15–30+ секунд: несколько Jev requests идут
 последовательно. Длительность сама по себе не означает fallback.
 
-Проверенный no-op local.7: durationMs=17, preTokens=2518, postTokens=61802,
-isCompactSummary=false. Обе оставшиеся Read-пары находились в recent pinned window.
+`preTokens`/`postTokens` в `compact_boundary` **не доказывают эффект**. До local.8 при ошибке
+и no-op хук возвращал исходные сообщения, движок всё равно писал boundary (no-op 21.09:
+`preTokens=2518`, `postTokens=61802`, 17 ms). Сессия 8c684e1d, 21.09 10:09 и 10:58: boundary
+«541k → 219k» и «682k → 273k», а следующий запрос к API ушёл с 544k и 683k токенов — сжатие
+не применилось. Причина подтверждена реплеем живой цепочки через планировщик: отказ
+`all user messages plus the minimal global dialogue index exceed the Jev state limit (~79k
+tokens, limit 30k)` за 71 ms (см. ниже).
+Эффект проверять по `usage` первого ответа после компакции: с local.8 плагин сам показывает
+toast «first request after compaction carried N tokens (before: M)».
 
-В custom compaction preTokens может означать только хвост после предыдущего boundary, тогда как
-postTokens — полный возвращённый контекст. UI "from 2.5k tokens" поэтому может быть misleading.
+Все сообщения роли user идут в каждый evidence shard целиком. Сюда попадают не только реплики
+владельца, но и прежние саммари Claude и вывод slash-команд: в 8c684e1d это 88k + 17k символов
+против 21k набранных. Оценщик токенов считает кириллицу по 0.9 токена на символ (английский
+текст — примерно 0.21). Из-за этого state переполняется, и компакция длинной сессии отказывает
+целиком. Решение — в плане методологии (`docs/review-2026-09-22.md`).
 
 ## Диагностика
 
 Function-hook validator не разрешает произвольный node:fs import. Persistent file diagnostics
-была удалена; использовать ui.log/toast и compact_boundary metadata.
+была удалена; использовать ui.log/toast и compact_boundary metadata, а для эффекта — `usage`
+следующего ответа в `.jsonl` транскрипта.
