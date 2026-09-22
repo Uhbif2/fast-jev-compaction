@@ -50,7 +50,7 @@ export type HookFetch = (url: string, init?: HookFetchInit) => Promise<HookFetch
 /** Waits between retries; the hook passes `$.clock.sleep`, tests pass an instant one. */
 export type HookSleep = (ms: number) => Promise<void>;
 
-export const LOCAL_BUILD = '0.3.0-local.9';
+export const LOCAL_BUILD = '0.3.0-local.10';
 
 export const JEV_MAX_ATTEMPTS = 6;
 const JEV_RETRY_DELAYS_MS = [1_000, 2_000, 4_000, 8_000, 15_000];
