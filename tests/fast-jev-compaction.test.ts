@@ -119,7 +119,7 @@ describe('tool call collection', () => {
   });
 
   it('ignores calls without a result', () => {
-    expect(collectToolCalls([message('user', 'hi'), call('x', 'Read', {}, '')], 0)).toHaveLength(0);
+    expect(collectToolCalls([message('user', 'hi'), message('assistant', '', { toolUses: [{ tool_use_id: 'x', tool: 'Read', input: {} }] })], 0)).toHaveLength(0);
   });
 
   it('shows Jev a real result preview and explicit relevance criteria', () => {

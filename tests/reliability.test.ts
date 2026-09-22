@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { compact, compactionCandidates, truncatedResultText } from '../src/compact.js';
+import { compact, compactionCandidates, messageChars, transcriptChars, truncatedResultText } from '../src/compact.js';
 import { collectToolCalls, estimateTokens, fitBatchStates, hasSideEffects, isCompactedResult } from '../src/state.js';
 import { noulAnswer, parseJevResponse } from '../src/request.js';
 import { jevAsker } from '../hooks/fast-jev.js';
@@ -94,6 +94,33 @@ describe('long dialogue coverage', () => {
 });
 
 describe('useful candidates and action records', () => {
+  it('uses an inline toolUse outcome when Claude omits a separate tool_result message', async () => {
+    const output = 'START\n' + 'historical inline output '.repeat(700) + '\nFINAL STATUS';
+    const messages: Message[] = [
+      text('user', 'Continue the current task.'),
+      {
+        role: 'assistant',
+        text: '',
+        toolUses: [{ tool: 'Read', tool_use_id: 'inline-only', input: { file_path: 'old.log' }, text: output }],
+      },
+      text('user', 'The useful conclusion is already recorded later.'),
+    ];
+    const calls = collectToolCalls(messages, 0);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({ tool_use_id: 'inline-only', resultChars: output.length, resultIndex: 1 });
+    expect(transcriptChars(messages)).toBe(messages.reduce((sum, message) => sum + messageChars(message), 0) + output.length);
+
+    const result = await compact(messages, low, { preserveRecentMessages: 0 });
+    expect(result.decisions[0]?.action).toBe('drop_call');
+    expect(result.stats.charsAfter).toBeLessThan(result.stats.charsBefore);
+    expect(result.messages.some((message) => message.toolUses.some((tool) => tool.tool_use_id === 'inline-only'))).toBe(false);
+  });
+
+  it('does not double-count an outcome when both inline text and tool_result are present', () => {
+    const messages = pair('Read');
+    expect(transcriptChars(messages)).toBe(messages.reduce((sum, message) => sum + messageChars(message), 0));
+  });
+
   it('does not mistake plugin source code or another call\'s note for a shortened result', () => {
     expect(isCompactedResult("const marker = '[fast-jev-compaction ';", 'u')).toBe(false);
     expect(isCompactedResult('[fast-jev-compaction truncated ${cut} of ${total} chars of this Read result]', 'u')).toBe(false);

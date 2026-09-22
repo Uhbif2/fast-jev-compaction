@@ -7,7 +7,7 @@
 - Upstream: tamaratran/fast-jev-compaction 0.3.0.
 - Local plugin: fast-jev-compaction-local@fast-jev-compaction-local.
 - Upstream установлен отдельно и disabled.
-- Текущий local release: 0.3.0-local.12.
+- Текущий local release: 0.3.0-local.13.
 - Единственный рабочий исходник: `<repo>` (свой git с 22.09.2026;
   базовая точка — тег `v0.3.0-local.7`). Local marketplace указывает сюда.
 
@@ -60,6 +60,14 @@ maxJevRequests=16
 
 Профиль перечитан из settings 22.09: порог уже был 0.5, прежнее значение 0.01 в документах
 устарело. В local.11 профиль владельца не менялся.
+
+## Изменения local.13
+
+- Claude Code может отдавать завершённый результат инструмента только внутри `SessionMessage.toolUses[].text`, без отдельного `toolResults`. Local.12 такие вызовы не считал парами и писал `nothing eligible (0 pinned tool pair(s))` даже в большой кодовой сессии.
+- `collectToolCalls` теперь использует inline `toolUse.text` как fallback результата, когда отдельного `tool_result` нет. Незавершённый вызов по-прежнему игнорируется: у него нет ни explicit result, ни inline text.
+- Размер transcript считает inline-result только если отдельного `tool_result` нет, поэтому reduction ratio не занижается и результат не откатывается как ложные 0%.
+- No-op теперь выводит форму входа: сколько paired calls, raw `tool_use`, explicit `tool_result` и inline outcomes. Это отличает реальный «нечего сокращать» от очередного несовпадения API.
+- Добавлены library- и hook-level тесты на inline-only outcome; полный suite перед выпуском: 65/65.
 
 ## Изменения local.12
 

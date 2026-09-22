@@ -60,7 +60,7 @@ const timerDeadline: DeadlineWait = (ms) => {
   return { expired, cancel: () => clearTimeout(timer) };
 };
 
-export const LOCAL_BUILD = '0.3.0-local.12';
+export const LOCAL_BUILD = '0.3.0-local.13';
 
 export const JEV_MAX_ATTEMPTS = 6;
 const JEV_RETRY_DELAYS_MS = [1_000, 2_000, 4_000, 8_000, 15_000];
@@ -492,11 +492,21 @@ export const register: Register = (on: On, options: PluginOptions) => {
       );
       const eligible = compactionCandidates(preflightCalls, resolvedPreflight).length;
       const pinned = preflightCalls.filter((call) => call.pinned).length;
+      const rawToolUses = event.messages.reduce((sum, message) => sum + message.toolUses.length, 0);
+      const explicitToolResults = event.messages.reduce((sum, message) => sum + (message.toolResults?.length ?? 0), 0);
+      const inlineOutcomes = event.messages.reduce(
+        (sum, message) => sum + message.toolUses.filter((tool) => tool.text !== undefined).length,
+        0,
+      );
       const assistantEligible = resolvedPreflight.compactAssistantText
         ? assistantTextCandidateIndices(event.messages, resolvedPreflight.preserveRecentMessages).length
         : 0;
       if (eligible === 0 && assistantEligible === 0) {
-        return await skipWith($, gate, `${tag}: nothing eligible (${pinned} pinned tool pair(s)); session unchanged, no Jev request`);
+        return await skipWith(
+          $,
+          gate,
+          `${tag}: nothing eligible (${pinned} pinned of ${preflightCalls.length} paired; raw ${rawToolUses} tool_use, ${explicitToolResults} tool_result, ${inlineOutcomes} inline outcome(s)); session unchanged, no Jev request`,
+        );
       }
 
       await sayNotice(
