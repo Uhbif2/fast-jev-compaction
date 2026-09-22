@@ -4,8 +4,12 @@ import {
   compactionGoal,
   jevAsker,
   LOCAL_BUILD,
+  progressNotice,
   register,
   retryAfterMs,
+  sayNotice,
+  TOAST_GAP_MS,
+  toastGate,
 } from '../hooks/fast-jev.ts';
 import type { Message } from '../src/index.js';
 
@@ -173,12 +177,35 @@ describe('auto-compaction from turn.complete', () => {
     let tokens = 400_000;
     const { handlers, $, order, toasts } = engine({
       context: () => ({ tokens, percent: tokens / 10_000, window: 1_000_000 }),
-      compact: async () => ({ messages: [] }),
     });
-    await handlers['turn.complete']!($, { turnId: '1' }, next(order));
+    const result = await handlers['session.compact']!($, { trigger: 'manual', messages: transcript() }, async () => {
+      throw new Error('next(event) was called');
+    });
+    expect(result.messages).toBeDefined();
     tokens = 180_000;
     await handlers['turn.complete']!($, { turnId: '2' }, next(order));
     expect(toasts.at(-1)).toMatch(/first request after compaction carried 180k tokens \(before: 400k\)/);
+  });
+});
+
+describe('notices', () => {
+  it('drops progress that comes too soon but always delivers the outcome', async () => {
+    let clock = 0;
+    const shown: string[] = [];
+    const waited: number[] = [];
+    const $ = {
+      ui: { log: () => {}, toast: (text: string) => void shown.push(text) },
+      clock: { sleep: async (ms: number) => { waited.push(ms); clock += ms; } },
+    };
+    const gate = toastGate(() => clock);
+    await sayNotice($, gate, 'start');
+    clock += 100;
+    progressNotice($, gate, 'request 1/6');
+    await sayNotice($, gate, 'failed');
+    clock += TOAST_GAP_MS;
+    progressNotice($, gate, 'request 2/6');
+    expect(shown).toEqual(['start', 'failed', 'request 2/6']);
+    expect(waited).toEqual([TOAST_GAP_MS - 100]);
   });
 });
 
