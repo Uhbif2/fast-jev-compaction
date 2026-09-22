@@ -1,15 +1,14 @@
 {
-  "name": "fast-jev-compaction",
+  "name": "fast-jev-compaction-local",
   "owner": {
-    "name": "tamaratran",
-    "url": "https://github.com/tamaratran"
+    "name": "local"
   },
   "plugins": [
     {
-      "name": "fast-jev-compaction",
+      "name": "fast-jev-compaction-local",
       "source": "./",
-      "description": "Verbatim Jev-guided compaction for Claude Code sessions.",
-      "version": "0.3.0",
+      "description": "Local hardened fast-jev compaction: Jev-only safe mode, conservative tool relevance scoring, result previews, sharded dialogue context, retries, and durable diagnostics.",
+      "version": "0.3.0-local.7",
       "license": "MIT"
     }
   ]

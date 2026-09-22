@@ -42,6 +42,8 @@ export interface ToolCall {
   /** Index of the message holding the tool_result block. */
   resultIndex: number;
   resultChars: number;
+  /** Head/tail preview of the actual result shown to Jev when scoring result relevance. */
+  resultPreview?: string;
   isError: boolean;
   /** In the first or the newest preserved messages; never a candidate. */
   pinned: boolean;
@@ -63,6 +65,14 @@ export interface CallDecision extends CallAnswer {
   reason: 'pinned' | 'kept' | 'result_dropped' | 'call_dropped';
 }
 
+export interface AssistantTextDecision {
+  /** Original message index in the transcript passed to compact(). */
+  index: number;
+  keep: number;
+  action: 'keep' | 'drop_text';
+  reason: 'pinned' | 'kept' | 'text_dropped';
+}
+
 export interface HistoryToolCall {
   id: string;
   tool: string;
@@ -82,13 +92,22 @@ export interface HistoryEntry {
 export interface CompactionState {
   context: string;
   goal: string;
+  /** Full-text dialogue evidence present in this shard, chronological. */
   history: HistoryEntry[];
+  /** Compact map of every text message across the whole conversation. */
+  dialogue_index?: Array<{ i: number; role: Role; excerpt: string; chars: number }>;
+  /** Compact chronology of tool activity across the whole conversation. */
+  tool_index?: string[];
+  /** Tool-call ids being judged in this request; target details live in each question. */
+  evaluating?: string[];
+  /** Diagnostic description of which full-text slice this state contains. */
+  shard?: string;
 }
 
 export interface FittedState {
   state: CompactionState;
   tokens: number;
-  /** Which fitting stage produced the state, for diagnostics. */
+  /** Which fitting/sharding stage produced the state, for diagnostics. */
   stage: string;
 }
 
@@ -105,6 +124,10 @@ export interface CompactOptions {
   maxRequestTokens?: number;
   /** Characters of a dropped tool result to retain. Default 300. */
   truncateHeadChars?: number;
+  /** Characters from each end of a tool result shown to Jev while scoring it. Default 1000. */
+  resultPreviewChars?: number;
+  /** Also score old assistant text for relevance; user text is never removed. Default true in the local fork. */
+  compactAssistantText?: boolean;
 }
 
 export interface ResolvedCompactOptions {
@@ -114,12 +137,15 @@ export interface ResolvedCompactOptions {
   maxStateTokens: number;
   maxRequestTokens: number;
   truncateHeadChars: number;
+  resultPreviewChars: number;
+  compactAssistantText: boolean;
 }
 
 export interface CompactResult {
   /** The compacted transcript; untouched messages are the input objects. */
   messages: Message[];
   decisions: CallDecision[];
+  assistantTextDecisions: AssistantTextDecision[];
   stats: {
     messagesBefore: number;
     messagesAfter: number;
@@ -130,6 +156,9 @@ export interface CompactResult {
     resultsDropped: number;
     callsDropped: number;
     pinned: number;
+    assistantTexts: number;
+    assistantTextsKept: number;
+    assistantTextsDropped: number;
     stateTokens: number;
     /** Which fitting stage the state needed, '' when no request was made. */
     stateStage: string;
@@ -143,7 +172,8 @@ export type JevState = string | object;
 
 export interface NoulQuestion {
   type: 'noul';
-  instructions: string;
+  /** TypeSafe accepts string or structured JSON instructions. */
+  instructions: string | Record<string, unknown> | unknown[];
   criteria?: {
     true?: string;
     false?: string;

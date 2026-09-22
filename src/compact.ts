@@ -1,12 +1,15 @@
 import { noulAnswer } from './request.js';
-import { collectToolCalls, estimateTokens, fitState } from './state.js';
+import { collectToolCalls, estimateTokens, fitBatchStates } from './state.js';
 import type {
+  AssistantTextDecision,
   CallAnswer,
   CallDecision,
   CompactOptions,
   CompactResult,
   CompactionState,
+  FittedState,
   JevAsker,
+  JevQuestion,
   JevQuestions,
   Message,
   ResolvedCompactOptions,
@@ -18,13 +21,19 @@ export const DEFAULT_OPTIONS: ResolvedCompactOptions = {
   goal: '',
   keepThreshold: 0.5,
   preserveRecentMessages: 6,
-  maxStateTokens: 25_000,
-  maxRequestTokens: 30_000,
+  maxStateTokens: 31_000,
+  maxRequestTokens: 62_000,
   truncateHeadChars: 300,
+  resultPreviewChars: 1_000,
+  compactAssistantText: false,
 };
 
-/** Tokens the request envelope (`model`, key names) adds around state and questions. */
-const REQUEST_OVERHEAD_TOKENS = 20;
+/** TypeSafe Jev 1.13 physical limits. */
+const JEV_TOTAL_REQUEST_TOKENS = 64_000;
+const JEV_STATE_PLUS_LONGEST_QUESTION_TOKENS = 32_000;
+/** Conservative room for model/key/envelope fields and estimator error. */
+const REQUEST_OVERHEAD_TOKENS = 100;
+const CONTEXT_SAFETY_MARGIN_TOKENS = 400;
 
 function finite(value: number | undefined, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
@@ -36,63 +45,241 @@ export function resolveOptions(options: CompactOptions = {}): ResolvedCompactOpt
     keepThreshold: finite(options.keepThreshold, DEFAULT_OPTIONS.keepThreshold),
     preserveRecentMessages: Math.max(
       0,
-      Math.floor(
-        finite(options.preserveRecentMessages, DEFAULT_OPTIONS.preserveRecentMessages),
-      ),
+      Math.floor(finite(options.preserveRecentMessages, DEFAULT_OPTIONS.preserveRecentMessages)),
     ),
-    maxStateTokens: Math.max(1, finite(options.maxStateTokens, DEFAULT_OPTIONS.maxStateTokens)),
-    maxRequestTokens: Math.max(
-      1,
-      finite(options.maxRequestTokens, DEFAULT_OPTIONS.maxRequestTokens),
+    maxStateTokens: Math.min(
+      31_000,
+      Math.max(1, finite(options.maxStateTokens, DEFAULT_OPTIONS.maxStateTokens)),
+    ),
+    maxRequestTokens: Math.min(
+      62_000,
+      Math.max(1, finite(options.maxRequestTokens, DEFAULT_OPTIONS.maxRequestTokens)),
     ),
     truncateHeadChars: Math.max(
       0,
       Math.floor(finite(options.truncateHeadChars, DEFAULT_OPTIONS.truncateHeadChars)),
     ),
+    resultPreviewChars: Math.max(
+      0,
+      Math.floor(finite(options.resultPreviewChars, DEFAULT_OPTIONS.resultPreviewChars)),
+    ),
+    compactAssistantText:
+      typeof options.compactAssistantText === 'boolean'
+        ? options.compactAssistantText
+        : DEFAULT_OPTIONS.compactAssistantText,
   };
 }
 
-/** The two `noul` questions asked about one call: keep the call, keep its result. */
-export function questionsFor(call: ToolCall): JevQuestions {
-  return {
-    [`call_${call.id}`]: {
-      type: 'noul',
-      instructions: `Tool call ${call.id} (${call.tool}) should stay in the history: knowing this call was made, with its input, still matters for what the assistant does next`,
-    },
-    [`result_${call.id}`]: {
-      type: 'noul',
-      instructions: `The full output of tool call ${call.id} (${call.tool}, ${call.resultChars} chars) should stay in the history verbatim: the assistant still needs its contents and re-running the tool would not do`,
-    },
-  };
+function boundedInput(input: Record<string, unknown>, limit = 4_000): string {
+  let text: string;
+  try {
+    text = JSON.stringify(input);
+  } catch {
+    text = '[unserializable input]';
+  }
+  return text.length <= limit ? text : text.slice(0, limit - 1) + '…';
 }
 
 /**
- * Splits the candidate calls into batches whose questions, together with the
- * (always complete) state, fit one request.
+ * Two atomic Noul judgments. The proposition is informational relevance to a
+ * correct continuation, not reproducibility and not a request to choose a
+ * retention strategy.
+ */
+export function questionsFor(call: ToolCall): JevQuestions {
+  const targetCall = {
+    id: call.id,
+    tool: call.tool,
+    input: boundedInput(call.input),
+  };
+  return {
+    [`call_${call.id}`]: {
+      type: 'noul',
+      instructions: {
+        question:
+          'Does this historical tool-call record contain information relevant to correctly continuing the current conversation from its latest point?',
+        target_call: targetCall,
+      },
+      criteria: {
+        true:
+          'The fact that this action occurred, its target/input, its side effect or failure, or its relation to later turns is relevant to interpreting the current state, honoring any still-applicable user requirement established anywhere in the dialogue, choosing or avoiding a next action, verifying work, explaining what has been done, or diagnosing a problem.',
+        false:
+          'The fact of this call and its input are fully superseded, duplicated, or unrelated to the current state and every still-applicable user requirement; removing this call record leaves no relevant information for correctly continuing this same conversation.',
+      },
+    },
+    [`result_${call.id}`]: {
+      type: 'noul',
+      instructions: {
+        question:
+          'Does the actual content of this historical tool result contain information relevant to correctly continuing the current conversation from its latest point?',
+        target_call: targetCall,
+        result: {
+          chars: call.resultChars,
+          is_error: call.isError,
+          preview: call.resultPreview ?? '',
+        },
+      },
+      criteria: {
+        true:
+          'Some specific content in this result—such as a value, text, error, path, state observation, evidence, constraint, or confirmation—is relevant to interpreting the current state, honoring a still-applicable user requirement, choosing or verifying a next action, explaining prior work, or diagnosing a problem.',
+        false:
+          'All informative content in this result is fully superseded, duplicated, or unrelated to the current state and every still-applicable user requirement; removing the result content leaves no relevant information for correctly continuing this same conversation.',
+      },
+    },
+  };
+}
+
+function questionTokenStats(batch: readonly ToolCall[]): {
+  questions: JevQuestions;
+  total: number;
+  longest: number;
+} {
+  const questions: JevQuestions = Object.assign({}, ...batch.map(questionsFor));
+  const sizes = Object.values(questions).map((q: JevQuestion) =>
+    estimateTokens(JSON.stringify(q)),
+  );
+  return {
+    questions,
+    total: sizes.reduce((sum, n) => sum + n, 0),
+    longest: sizes.length > 0 ? Math.max(...sizes) : 0,
+  };
+}
+
+export function assistantTextQuestion(index: number): JevQuestion {
+  return {
+    type: 'noul',
+    instructions: {
+      question:
+        'Does this historical assistant message contain information relevant to correctly continuing the current conversation from its latest point?',
+      target_message_index: index,
+      location:
+        'The complete target text is the assistant entry in state.history whose i equals target_message_index.',
+    },
+    criteria: {
+      true:
+        'The message contributes at least one still-applicable fact, observed state, decision, constraint, commitment, unresolved task, rationale, causal link, warning, result interpretation, path/value, or other information that can affect a correct continuation of this same conversation.',
+      false:
+        'The message is purely transient narration or acknowledgement, or every informative part is fully superseded, duplicated, invalidated, or otherwise irrelevant to every still-applicable user requirement and to the current state; its text adds no information needed for a correct continuation.',
+    },
+  };
+}
+
+function assistantQuestionTokenStats(indices: readonly number[]): {
+  questions: JevQuestions;
+  total: number;
+  longest: number;
+} {
+  const questions: JevQuestions = Object.fromEntries(
+    indices.map((index) => [`assistant_${index}`, assistantTextQuestion(index)]),
+  );
+  const sizes = Object.values(questions).map((q: JevQuestion) =>
+    estimateTokens(JSON.stringify(q)),
+  );
+  return {
+    questions,
+    total: sizes.reduce((sum, n) => sum + n, 0),
+    longest: sizes.length > 0 ? Math.max(...sizes) : 0,
+  };
+}
+
+export function assistantTextCandidateIndices(
+  messages: readonly Message[],
+  preserveRecentMessages: number,
+): number[] {
+  const preserveStart = Math.max(0, messages.length - Math.max(0, preserveRecentMessages));
+  const indices: number[] = [];
+  for (let index = 0; index < messages.length; index += 1) {
+    const message = messages[index]!;
+    if (index === 0 || index >= preserveStart) continue;
+    if (message.role !== 'assistant' || message.text.trim().length === 0) continue;
+    indices.push(index);
+  }
+  return indices;
+}
+
+function batchAssistantIndices(
+  indices: readonly number[],
+  stateTokens: number,
+  options: Pick<ResolvedCompactOptions, 'maxRequestTokens'>,
+  baseQuestionTokens = 0,
+): number[][] {
+  const requestLimit = Math.min(options.maxRequestTokens, JEV_TOTAL_REQUEST_TOKENS);
+  const batches: number[][] = [];
+  let current: number[] = [];
+  for (const index of indices) {
+    const single = assistantQuestionTokenStats([index]);
+    if (
+      stateTokens + single.longest + REQUEST_OVERHEAD_TOKENS >
+      JEV_STATE_PLUS_LONGEST_QUESTION_TOKENS
+    ) {
+      throw new Error(
+        'assistant-text state plus longest question exceeds Jev 32k limit (~' +
+          (stateTokens + single.longest) +
+          ' tokens)',
+      );
+    }
+    const proposed = [...current, index];
+    const stats = assistantQuestionTokenStats(proposed);
+    if (
+      current.length > 0 &&
+      stateTokens + baseQuestionTokens + stats.total + REQUEST_OVERHEAD_TOKENS > requestLimit
+    ) {
+      batches.push(current);
+      current = [index];
+    } else {
+      current = proposed;
+    }
+  }
+  if (current.length > 0) batches.push(current);
+  return batches;
+}
+
+async function askAssistantBatch(
+  asker: JevAsker,
+  state: CompactionState,
+  indices: readonly number[],
+): Promise<Map<number, number>> {
+  const questions = assistantQuestionTokenStats(indices).questions;
+  const { answers } = await asker.ask(state, questions);
+  return new Map(
+    indices.map((index) => [index, noulAnswer(answers, `assistant_${index}`)]),
+  );
+}
+
+/**
+ * Legacy helper retained for library users. It now enforces both Jev limits:
+ * 64k total request and 32k for state + the longest individual question.
  */
 export function batchCalls(
   calls: readonly ToolCall[],
   stateTokens: number,
   options: Pick<ResolvedCompactOptions, 'maxRequestTokens'>,
 ): ToolCall[][] {
-  const budget = options.maxRequestTokens - stateTokens - REQUEST_OVERHEAD_TOKENS;
+  const requestLimit = Math.min(options.maxRequestTokens, JEV_TOTAL_REQUEST_TOKENS);
   const batches: ToolCall[][] = [];
   let current: ToolCall[] = [];
-  let currentTokens = 0;
   for (const call of calls) {
-    const tokens = estimateTokens(JSON.stringify(questionsFor(call)));
-    if (current.length > 0 && currentTokens + tokens > budget) {
-      batches.push(current);
-      current = [];
-      currentTokens = 0;
-    }
-    if (current.length === 0 && tokens > budget) {
+    const single = questionTokenStats([call]);
+    if (
+      stateTokens + single.longest + REQUEST_OVERHEAD_TOKENS >
+      JEV_STATE_PLUS_LONGEST_QUESTION_TOKENS
+    ) {
       throw new Error(
-        `state leaves no room for questions (~${stateTokens} of ${options.maxRequestTokens} tokens)`,
+        'state plus longest question exceeds Jev 32k limit (~' +
+          (stateTokens + single.longest) +
+          ' tokens)',
       );
     }
-    current.push(call);
-    currentTokens += tokens;
+    const proposed = [...current, call];
+    const stats = questionTokenStats(proposed);
+    if (
+      current.length > 0 &&
+      stateTokens + stats.total + REQUEST_OVERHEAD_TOKENS > requestLimit
+    ) {
+      batches.push(current);
+      current = [call];
+    } else {
+      current = proposed;
+    }
   }
   if (current.length > 0) batches.push(current);
   return batches;
@@ -114,22 +301,112 @@ export function decideCall(
   return { ...base, action: 'drop_call', reason: 'call_dropped' };
 }
 
+type BatchAnswers = {
+  calls: Map<string, CallAnswer>;
+  assistantTexts: Map<number, number>;
+};
+
 async function askBatch(
   asker: JevAsker,
   state: CompactionState,
   batch: readonly ToolCall[],
-): Promise<Map<string, CallAnswer>> {
-  const questions: JevQuestions = Object.assign({}, ...batch.map(questionsFor));
+  assistantIndices: readonly number[] = [],
+): Promise<BatchAnswers> {
+  const questions: JevQuestions = {
+    ...questionTokenStats(batch).questions,
+    ...assistantQuestionTokenStats(assistantIndices).questions,
+  };
+  if (Object.keys(questions).length === 0) {
+    return { calls: new Map(), assistantTexts: new Map() };
+  }
   const { answers } = await asker.ask(state, questions);
-  return new Map(
-    batch.map((call) => [
-      call.id,
-      {
-        keepCall: noulAnswer(answers, `call_${call.id}`),
-        keepResult: noulAnswer(answers, `result_${call.id}`),
-      },
-    ]),
+  return {
+    calls: new Map(
+      batch.map((call) => [
+        call.id,
+        {
+          keepCall: noulAnswer(answers, `call_${call.id}`),
+          keepResult: noulAnswer(answers, `result_${call.id}`),
+        },
+      ]),
+    ),
+    assistantTexts: new Map(
+      assistantIndices.map((index) => [
+        index,
+        noulAnswer(answers, `assistant_${index}`),
+      ]),
+    ),
+  };
+}
+
+type BatchPlan = {
+  batch: ToolCall[];
+  states: FittedState[];
+};
+
+function makeBatchPlan(
+  messages: readonly Message[],
+  calls: readonly ToolCall[],
+  batch: readonly ToolCall[],
+  options: ResolvedCompactOptions,
+): BatchPlan | null {
+  const q = questionTokenStats(batch);
+  const stateLimit = Math.min(
+    options.maxStateTokens,
+    JEV_STATE_PLUS_LONGEST_QUESTION_TOKENS -
+      q.longest -
+      REQUEST_OVERHEAD_TOKENS -
+      CONTEXT_SAFETY_MARGIN_TOKENS,
   );
+  if (stateLimit < 1) {
+    throw new Error('a Jev question is too large to leave room for conversation state');
+  }
+
+  const states = fitBatchStates(messages, calls, batch, options, stateLimit);
+  const requestLimit = Math.min(options.maxRequestTokens, JEV_TOTAL_REQUEST_TOKENS);
+  for (const state of states) {
+    if (
+      state.tokens + q.longest + REQUEST_OVERHEAD_TOKENS >
+      JEV_STATE_PLUS_LONGEST_QUESTION_TOKENS
+    ) {
+      throw new Error('batch shard exceeds Jev 32k state+longest-question limit');
+    }
+    if (state.tokens + q.total + REQUEST_OVERHEAD_TOKENS > requestLimit) return null;
+  }
+  return { batch: [...batch], states };
+}
+
+function planBatches(
+  messages: readonly Message[],
+  calls: readonly ToolCall[],
+  candidates: readonly ToolCall[],
+  options: ResolvedCompactOptions,
+): BatchPlan[] {
+  const plans: BatchPlan[] = [];
+  let current: ToolCall[] = [];
+  for (const call of candidates) {
+    const proposed = [...current, call];
+    const plan = makeBatchPlan(messages, calls, proposed, options);
+    if (plan) {
+      current = proposed;
+      continue;
+    }
+    if (current.length === 0) {
+      throw new Error('one Jev candidate cannot fit within the request limits');
+    }
+    const completed = makeBatchPlan(messages, calls, current, options);
+    if (!completed) throw new Error('internal batching error');
+    plans.push(completed);
+    current = [call];
+    const single = makeBatchPlan(messages, calls, current, options);
+    if (!single) throw new Error('one Jev candidate cannot fit within the request limits');
+  }
+  if (current.length > 0) {
+    const completed = makeBatchPlan(messages, calls, current, options);
+    if (!completed) throw new Error('internal batching error');
+    plans.push(completed);
+  }
+  return plans;
 }
 
 function truncatedResultText(text: string, isError: boolean, headChars: number): string {
@@ -151,6 +428,7 @@ export function applyDecisions(
   decisions: readonly CallDecision[],
   calls: readonly ToolCall[],
   headChars: number,
+  dropAssistantTextIndices: ReadonlySet<number> = new Set<number>(),
 ): Message[] {
   const byId = new Map(calls.map((call) => [call.id, call]));
   const actions = new Map<string, CallDecision['action']>();
@@ -159,8 +437,12 @@ export function applyDecisions(
     if (call && decision.action !== 'keep') actions.set(call.tool_use_id, decision.action);
   }
   const kept: Message[] = [];
-  for (const message of messages) {
+  for (let messageIndex = 0; messageIndex < messages.length; messageIndex += 1) {
+    const message = messages[messageIndex]!;
+    const dropAssistantText =
+      message.role === 'assistant' && dropAssistantTextIndices.has(messageIndex);
     const touched =
+      dropAssistantText ||
       message.toolUses.some((tool) => actions.has(tool.tool_use_id)) ||
       (message.toolResults ?? []).some((result) => actions.has(result.tool_use_id));
     if (!touched) {
@@ -209,15 +491,17 @@ export function applyDecisions(
       toolUses.every((tool, index) => tool === message.toolUses[index]) &&
       toolResults.every(
         (result, index) => result === message.toolResults?.[index],
-      )
+      ) &&
+      !dropAssistantText
     ) {
       kept.push(message);
       continue;
     }
-    if (message.text.trim().length === 0 && toolUses.length === 0 && toolResults.length === 0) {
+    const text = dropAssistantText ? '' : message.text;
+    if (text.trim().length === 0 && toolUses.length === 0 && toolResults.length === 0) {
       continue;
     }
-    const rebuilt: Message = { role: message.role, text: message.text, toolUses };
+    const rebuilt: Message = { role: message.role, text, toolUses };
     if (toolResults.length > 0) rebuilt.toolResults = toolResults;
     kept.push(rebuilt);
   }
@@ -248,11 +532,11 @@ function count(decisions: readonly CallDecision[], reason: CallDecision['reason'
 }
 
 /**
- * Compacts a transcript by asking Jev, for every tool call outside the pinned
- * first and newest messages, whether the call and whether its result must
- * stay. The whole history (results omitted, fitted into `maxStateTokens`) is
- * sent as state with every batch of questions. Throws when Jev fails or the
- * history cannot be fitted; the caller decides whether to fall back.
+ * Compacts tool history and, in the local fork, old assistant text.
+ *
+ * User text is never removed. Recent messages are pinned. Old assistant text
+ * is scored only in shards where that exact message is present verbatim; the
+ * dialogue index gives each shard a map of the rest of the conversation.
  */
 export async function compact(
   messages: readonly Message[],
@@ -261,35 +545,152 @@ export async function compact(
 ): Promise<CompactResult> {
   const started = Date.now();
   const resolved = resolveOptions(options);
-  const calls = collectToolCalls(messages, resolved.preserveRecentMessages);
-  const candidates = calls.filter((call) => !call.pinned);
+  const calls = collectToolCalls(
+    messages,
+    resolved.preserveRecentMessages,
+    resolved.resultPreviewChars,
+  );
+  const toolCandidates = calls.filter((call) => !call.pinned);
+  const assistantCandidates = resolved.compactAssistantText
+    ? assistantTextCandidateIndices(messages, resolved.preserveRecentMessages)
+    : [];
+  const assistantCandidateSet = new Set(assistantCandidates);
   const charsBefore = messages.reduce((sum, message) => sum + messageChars(message), 0);
 
-  let fitted: { tokens: number; stage: string } = { tokens: 0, stage: '' };
-  let batches: ToolCall[][] = [];
+  const stages = new Set<string>();
+  let maxStateTokens = 0;
+  let maxShards = 0;
+  let requestCount = 0;
   const answers = new Map<string, CallAnswer>();
-  if (candidates.length > 0) {
-    const state = fitState(messages, calls, resolved);
-    fitted = state;
-    batches = batchCalls(candidates, state.tokens, resolved);
-    const answered = await Promise.all(
-      batches.map((batch) => askBatch(asker, state.state, batch)),
+  const assistantScores = new Map<number, number>();
+
+  const mergeCallAnswers = (answered: Map<string, CallAnswer>): void => {
+    for (const [id, answer] of answered) {
+      const previous = answers.get(id);
+      answers.set(id, {
+        keepCall: Math.max(previous?.keepCall ?? 0, answer.keepCall),
+        keepResult: Math.max(previous?.keepResult ?? 0, answer.keepResult),
+      });
+    }
+  };
+  const mergeAssistantAnswers = (answered: Map<number, number>): void => {
+    for (const [index, keep] of answered) {
+      assistantScores.set(index, Math.max(assistantScores.get(index) ?? 0, keep));
+    }
+  };
+  const assistantIndicesInState = (state: FittedState): number[] =>
+    state.state.history
+      .filter(
+        (entry) =>
+          entry.role === 'assistant' &&
+          assistantCandidateSet.has(entry.i) &&
+          entry.text.trim().length > 0,
+      )
+      .map((entry) => entry.i);
+
+  if (toolCandidates.length > 0) {
+    const plans = planBatches(messages, calls, toolCandidates, resolved);
+    for (let planIndex = 0; planIndex < plans.length; planIndex += 1) {
+      const plan = plans[planIndex]!;
+      maxShards = Math.max(maxShards, plan.states.length);
+      for (const state of plan.states) {
+        stages.add(state.stage);
+        maxStateTokens = Math.max(maxStateTokens, state.tokens);
+
+        // Score assistant text only on the first tool plan. Its shards already
+        // cover every old assistant message verbatim, so later tool plans do
+        // not need to repeat those questions.
+        const assistantIndices =
+          planIndex === 0 ? assistantIndicesInState(state) : [];
+        const toolStats = questionTokenStats(plan.batch);
+        const assistantBatches = batchAssistantIndices(
+          assistantIndices,
+          state.tokens,
+          resolved,
+          toolStats.total,
+        );
+
+        if (assistantBatches.length === 0) {
+          requestCount += 1;
+          const answered = await askBatch(asker, state.state, plan.batch);
+          mergeCallAnswers(answered.calls);
+          continue;
+        }
+
+        for (let groupIndex = 0; groupIndex < assistantBatches.length; groupIndex += 1) {
+          const group = assistantBatches[groupIndex]!;
+          requestCount += 1;
+          const answered = await askBatch(
+            asker,
+            state.state,
+            groupIndex === 0 ? plan.batch : [],
+            group,
+          );
+          mergeCallAnswers(answered.calls);
+          mergeAssistantAnswers(answered.assistantTexts);
+        }
+      }
+    }
+  } else if (assistantCandidates.length > 0) {
+    const q = assistantQuestionTokenStats(assistantCandidates);
+    const stateLimit = Math.min(
+      resolved.maxStateTokens,
+      JEV_STATE_PLUS_LONGEST_QUESTION_TOKENS -
+        q.longest -
+        REQUEST_OVERHEAD_TOKENS -
+        CONTEXT_SAFETY_MARGIN_TOKENS,
     );
-    for (const map of answered) for (const [id, answer] of map) answers.set(id, answer);
+    if (stateLimit < 1) {
+      throw new Error('assistant relevance question is too large to leave room for conversation state');
+    }
+    const states = fitBatchStates(messages, calls, [], resolved, stateLimit);
+    maxShards = states.length;
+    for (const state of states) {
+      stages.add(state.stage);
+      maxStateTokens = Math.max(maxStateTokens, state.tokens);
+      const assistantIndices = assistantIndicesInState(state);
+      const groups = batchAssistantIndices(assistantIndices, state.tokens, resolved);
+      for (const group of groups) {
+        requestCount += 1;
+        const answered = await askBatch(asker, state.state, [], group);
+        mergeAssistantAnswers(answered.assistantTexts);
+      }
+    }
+  }
+
+  for (const index of assistantCandidates) {
+    if (!assistantScores.has(index)) {
+      throw new Error(
+        'assistant message ' + index + ' was not visible verbatim in any Jev evidence shard',
+      );
+    }
   }
 
   const decisions = calls.map((call) =>
     decideCall(call, answers.get(call.id) ?? { keepCall: 1, keepResult: 1 }, resolved),
+  );
+  const assistantTextDecisions: AssistantTextDecision[] = assistantCandidates.map((index) => {
+    const keep = assistantScores.get(index) ?? 1;
+    return keep >= resolved.keepThreshold
+      ? { index, keep, action: 'keep', reason: 'kept' }
+      : { index, keep, action: 'drop_text', reason: 'text_dropped' };
+  });
+  const dropAssistantTextIndices = new Set(
+    assistantTextDecisions
+      .filter((decision) => decision.action === 'drop_text')
+      .map((decision) => decision.index),
   );
   const kept = applyDecisions(
     messages,
     decisions,
     calls,
     resolved.truncateHeadChars,
+    dropAssistantTextIndices,
   );
   return {
     messages: kept,
     decisions,
+    assistantTextDecisions,
     stats: {
       messagesBefore: messages.length,
       messagesAfter: kept.length,
@@ -300,9 +701,18 @@ export async function compact(
       resultsDropped: count(decisions, 'result_dropped'),
       callsDropped: count(decisions, 'call_dropped'),
       pinned: count(decisions, 'pinned'),
-      stateTokens: fitted.tokens,
-      stateStage: fitted.stage,
-      requests: batches.length,
+      assistantTexts: assistantTextDecisions.length,
+      assistantTextsKept: assistantTextDecisions.filter((d) => d.action === 'keep').length,
+      assistantTextsDropped: assistantTextDecisions.filter((d) => d.action === 'drop_text').length,
+      stateTokens: maxStateTokens,
+      stateStage:
+        requestCount > 0
+          ? 'max-over-shards; up to ' +
+            maxShards +
+            ' evidence shard(s); ' +
+            [...stages].join(' | ')
+          : '',
+      requests: requestCount,
       ms: Date.now() - started,
     },
   };

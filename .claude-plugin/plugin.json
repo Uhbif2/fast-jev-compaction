@@ -1,7 +1,7 @@
 {
-  "name": "fast-jev-compaction",
-  "version": "0.3.0",
-  "description": "Verbatim Jev-guided compaction for Claude Code sessions.",
+  "name": "fast-jev-compaction-local",
+  "version": "0.3.0-local.7",
+  "description": "Local hardened fast-jev compaction: Jev-only safe mode, conservative tool relevance scoring, result previews, sharded dialogue context, retries, and durable diagnostics.",
   "license": "MIT",
   "userConfig": {
     "apiKey": {
@@ -13,7 +13,7 @@
     "keepThreshold": {
       "type": "number",
       "title": "Keep threshold",
-      "description": "Minimum Jev probability that a tool call or tool result is still needed; below it the item is removed.",
+      "description": "Minimum Jev probability that a tool call, tool result, or old assistant text is still relevant; below it the item is removed.",
       "default": 0.5
     },
     "preserveRecentMessages": {
@@ -31,20 +31,20 @@
     "minReductionRatio": {
       "type": "number",
       "title": "Minimum reduction ratio",
-      "description": "Minimum estimated character reduction required to replace history.",
-      "default": 0.25
+      "description": "Minimum estimated character reduction required to apply Jev output. Below it the session is left unchanged; this local fork never falls back to Claude summarization.",
+      "default": 0
     },
     "maxStateTokens": {
       "type": "number",
       "title": "Maximum Jev state tokens",
-      "description": "Estimated token budget for the conversation state sent with every Jev request.",
-      "default": 25000
+      "description": "Estimated ceiling for per-batch Jev state. Dialogue text is never abridged; hard-clamped below Jev's 32k state+longest-question limit.",
+      "default": 31000
     },
     "maxRequestTokens": {
       "type": "number",
       "title": "Maximum Jev request tokens",
-      "description": "Estimated token budget for state plus questions in one Jev request.",
-      "default": 30000
+      "description": "Estimated ceiling for one whole Jev request. Jev 1.13 allows 64k total; local fork keeps a safety margin.",
+      "default": 62000
     },
     "truncateHeadChars": {
       "type": "number",
@@ -57,6 +57,18 @@
       "title": "Jev model",
       "description": "TypeSafe Jev model name.",
       "default": "jev-latest"
+    },
+    "resultPreviewChars": {
+      "type": "number",
+      "title": "Tool result preview for Jev",
+      "description": "Characters from each end of a tool result shown to Jev while judging informational relevance.",
+      "default": 1000
+    },
+    "compactAssistantText": {
+      "type": "boolean",
+      "title": "Compact old assistant text",
+      "description": "Optional experimental scoring/removal of old assistant text. Disabled by default. When false, all user and assistant text is preserved verbatim and only tool calls/results are compacted.",
+      "default": false
     }
   }
 }

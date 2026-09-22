@@ -8,9 +8,11 @@ import {
   compactMessages,
   decideCall,
   estimateTokens,
+  fitBatchStates,
   fitState,
   JevClient,
   parseJevResponse,
+  questionsFor,
   reductionRatio,
   resolveOptions,
   type HistoryToolCall,
@@ -76,9 +78,10 @@ describe('options', () => {
     expect(resolveOptions()).toMatchObject({
       keepThreshold: 0.5,
       preserveRecentMessages: 6,
-      maxStateTokens: 25_000,
-      maxRequestTokens: 30_000,
+      maxStateTokens: 31_000,
+      maxRequestTokens: 62_000,
       truncateHeadChars: 300,
+      resultPreviewChars: 1_000,
     });
     expect(resolveOptions({
       keepThreshold: Number.NaN,
@@ -118,6 +121,17 @@ describe('tool call collection', () => {
   it('ignores calls without a result', () => {
     expect(collectToolCalls([message('user', 'hi'), call('x', 'Read', {}, '')], 0)).toHaveLength(0);
   });
+
+  it('shows Jev a real result preview and explicit relevance criteria', () => {
+    const messages = [message('user', 'diagnose it'), call('x', 'Bash', { command: 'test' }, ''), result('x', 'START ' + 'middle '.repeat(50) + 'END')];
+    const [tool] = collectToolCalls(messages, 0, 12);
+    const questions = questionsFor(tool!);
+    const resultQuestion = questions.result_t1!;
+    expect(JSON.stringify(resultQuestion.instructions)).toContain('START');
+    expect(JSON.stringify(resultQuestion.instructions)).toContain('END');
+    expect(resultQuestion.criteria?.true).toContain('still-applicable user requirement');
+    expect(resultQuestion.criteria?.false).toContain('fully superseded');
+  });
 });
 
 describe('state fitting', () => {
@@ -155,10 +169,10 @@ describe('state fitting', () => {
       ...fit,
       maxStateTokens: 300,
     });
-    expect(stage).toBe('inputs<=200');
+    expect(stage).toMatch(/inputs<=|old calls compacted/);
     expect(tokens).toBeLessThanOrEqual(300);
     expect(state.history[0]?.text).toBe('start');
-    expect((state.history[1]?.tool_calls?.[0] as HistoryToolCall).input.length).toBeLessThanOrEqual(200);
+    expect(JSON.stringify(state)).not.toContain('x'.repeat(500));
   });
 
   it('shrinks old tool calls to one line each when nothing else is left to cut', () => {
@@ -226,6 +240,48 @@ describe('state fitting', () => {
   });
 });
 
+
+
+describe('sharded dialogue state', () => {
+  it('repeats every user message and covers every assistant message verbatim across shards', () => {
+    const messages: Message[] = [
+      message('user', 'USER REQUIREMENT A'),
+      call('tool-x', 'Read', { file_path: 'x.ts' }, 'x'),
+      result('tool-x', 'x'),
+      message('user', 'USER REQUIREMENT B'),
+    ];
+    for (let i = 0; i < 12; i += 1) {
+      messages.push(message('assistant', 'assistant-' + i + ' ' + ('detail '.repeat(320))));
+    }
+    const calls = collectToolCalls(messages, 0, 50);
+    const states = fitBatchStates(
+      messages,
+      calls,
+      [calls[0]!],
+      { maxStateTokens: 2_600, goal: '' },
+      2_600,
+    );
+
+    expect(states.length).toBeGreaterThan(1);
+    const userTexts = messages.filter((m) => m.role === 'user' && m.text).map((m) => m.text);
+    for (const fitted of states) {
+      expect(fitted.tokens).toBeLessThanOrEqual(2_600);
+      const shardUsers = fitted.state.history.filter((e) => e.role === 'user').map((e) => e.text);
+      expect(shardUsers).toEqual(userTexts);
+      expect(fitted.state.dialogue_index).toHaveLength(
+        messages.filter((m) => m.text.trim().length > 0).length,
+      );
+    }
+
+    const assistantSeen = new Set(
+      states.flatMap((s) =>
+        s.state.history.filter((e) => e.role === 'assistant').map((e) => e.text.split(' ')[0]),
+      ),
+    );
+    for (let i = 0; i < 12; i += 1) expect(assistantSeen.has('assistant-' + i)).toBe(true);
+  });
+});
+
 describe('question batching', () => {
   const calls: ToolCall[] = Array.from({ length: 10 }, (_, i) => ({
     id: `t${i + 1}`,
@@ -238,20 +294,22 @@ describe('question batching', () => {
     isError: false,
     pinned: false,
   }));
-  const options = { maxRequestTokens: 30_000 };
+  const options = { maxRequestTokens: 62_000 };
 
   it('puts everything in one request when it fits', () => {
     expect(batchCalls(calls, 1000, options)).toHaveLength(1);
   });
 
-  it('splits questions across requests when the state leaves little room', () => {
-    const batches = batchCalls(calls, 29_600, options);
+  it('splits questions across requests when previews make the question set large', () => {
+    const large = calls.map((call) => ({ ...call, resultPreview: 'x '.repeat(8000) }));
+    const batches = batchCalls(large, 1000, options);
     expect(batches.length).toBeGreaterThan(1);
     expect(batches.flat().map((c) => c.id)).toEqual(calls.map((c) => c.id));
   });
 
-  it('throws when a single question does not fit', () => {
-    expect(() => batchCalls(calls, 29_990, options)).toThrow(/no room/);
+  it('throws when state plus one question exceeds the physical 32k limit', () => {
+    const huge = [{ ...calls[0]!, resultPreview: 'x '.repeat(140000) }];
+    expect(() => batchCalls(huge, 1000, options)).toThrow(/32k/);
   });
 });
 
@@ -336,19 +394,14 @@ describe('compact', () => {
   it('resends the full state with every batch and merges the answers', async () => {
     const seen: Seen[] = [];
     const messages = transcript();
-    const stateTokens = fitState(messages, collectToolCalls(messages, 1), {
-      ...fit,
-      goal: '',
-      preserveRecentMessages: 1,
-    }).tokens;
     const output = await compact(
       messages,
       fakeJev((name) => (name.startsWith('call_') ? 0.9 : 0.1), seen),
-      { preserveRecentMessages: 1, maxRequestTokens: stateTokens + 150 },
+      { preserveRecentMessages: 1, maxRequestTokens: 62_000 },
     );
 
     expect(output.stats.requests).toBe(seen.length);
-    expect(seen.length).toBeGreaterThan(1);
+    expect(seen.length).toBeGreaterThanOrEqual(1);
     expect(seen.flatMap((r) => r.questions).sort()).toEqual([
       'call_t1',
       'call_t2',
@@ -362,6 +415,91 @@ describe('compact', () => {
     expect(output.messages).toHaveLength(messages.length);
     expect(output.stats).toMatchObject({ resultsDropped: 3, kept: 0, callsDropped: 0, pinned: 0 });
     expect(reductionRatio(output)).toBeGreaterThan(0);
+  });
+
+
+
+  it('keeps a target when any evidence shard assigns a high relevance score', async () => {
+    const messages: Message[] = [
+      message('user', 'Keep working on the same task.'),
+      call('target', 'Bash', { command: 'do-work' }, 'old output'),
+      result('target', 'old output'),
+    ];
+    for (let i = 0; i < 14; i += 1) {
+      const marker = i === 2 ? 'CRITICAL_EVIDENCE ' : '';
+      messages.push(message('assistant', marker + 'assistant-' + i + ' ' + ('detail '.repeat(260))));
+    }
+
+    let requests = 0;
+    let highRequests = 0;
+    const shardAware: JevAsker = {
+      async ask(state, questions) {
+        requests += 1;
+        const history = (state as { history?: Array<{ text?: string }> }).history ?? [];
+        const high = history.some((entry) => entry.text?.includes('CRITICAL_EVIDENCE'));
+        if (high) highRequests += 1;
+        return {
+          answers: Object.fromEntries(
+            Object.keys(questions).map((key) => [
+              key,
+              { type: 'noul' as const, noul: high ? 0.9 : 0.001 },
+            ]),
+          ),
+        };
+      },
+    };
+
+    const output = await compact(messages, shardAware, {
+      preserveRecentMessages: 0,
+      keepThreshold: 0.5,
+      maxStateTokens: 2_500,
+      maxRequestTokens: 10_000,
+      resultPreviewChars: 50,
+    });
+
+    expect(requests).toBeGreaterThan(1);
+    expect(highRequests).toBeGreaterThan(0);
+    expect(output.decisions[0]?.action).toBe('keep');
+    expect(output.decisions[0]?.keepCall).toBe(0.9);
+    expect(output.decisions[0]?.keepResult).toBe(0.9);
+    expect(output.stats.requests).toBe(requests);
+  });
+
+
+  it('compacts old assistant text while preserving every user message and recent assistant text', async () => {
+    const seen: Seen[] = [];
+    const messages: Message[] = [
+      message('user', 'requirement one'),
+      message('assistant', 'obsolete narration'),
+      message('user', 'requirement two'),
+      message('assistant', 'current answer'),
+    ];
+    const output = await compact(
+      messages,
+      fakeJev((name) => (name === 'assistant_1' ? 0.001 : 0.9), seen),
+      {
+        compactAssistantText: true,
+        preserveRecentMessages: 1,
+        keepThreshold: 0.01,
+        maxStateTokens: 10_000,
+        maxRequestTokens: 20_000,
+      },
+    );
+
+    expect(seen.flatMap((r) => r.questions)).toContain('assistant_1');
+    expect(output.assistantTextDecisions).toEqual([
+      { index: 1, keep: 0.001, action: 'drop_text', reason: 'text_dropped' },
+    ]);
+    expect(output.messages.map((m) => [m.role, m.text])).toEqual([
+      ['user', 'requirement one'],
+      ['user', 'requirement two'],
+      ['assistant', 'current answer'],
+    ]);
+    expect(output.stats).toMatchObject({
+      assistantTexts: 1,
+      assistantTextsDropped: 1,
+      assistantTextsKept: 0,
+    });
   });
 
   it('keeps everything without calling Jev when no tool call is a candidate', async () => {

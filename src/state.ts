@@ -9,7 +9,7 @@ import type {
 } from './types.js';
 
 export const STATE_CONTEXT =
-  'A coding assistant conversation is being compacted to free context. `history` is the whole conversation so far, oldest first; tool outputs are replaced by a short `result` note and long texts may be abridged. Each question asks whether one tool call, or the full output of that call, still needs to stay in the history verbatim. Whatever is not kept is deleted permanently, but the assistant can always re-run a tool or re-read a file.';
+  'A coding-assistant conversation is being compacted. This request is one evidence shard from the same conversation. `history` contains every user text message verbatim, a verbatim recent assistant anchor, and one verbatim historical assistant slice; `dialogue_index` maps the entire text dialogue so omitted assistant slices remain globally locatable; `tool_index`, when present, is a compact chronology of tool activity. Other shards evaluate the same targets against the other assistant slices. Each question asks whether one historical tool call or result contains information relevant to correctly continuing this same conversation from its latest point.';
 
 /** Successive caps on the serialised tool input included per call. */
 const INPUT_CHARS = [1000, 200, 60] as const;
@@ -55,6 +55,14 @@ export function isPinned(
   return index === 0 || index >= total - preserveRecentMessages;
 }
 
+/** Head and tail of a tool result, whitespace collapsed, for a relevance question. */
+export function resultPreview(text: string, chars: number): string {
+  if (chars <= 0) return '';
+  const flat = text.replace(/\s+/g, ' ').trim();
+  if (flat.length <= chars * 2 + 20) return flat;
+  return `${flat.slice(0, chars)} … ${flat.slice(-chars)}`;
+}
+
 /**
  * Pairs every tool_use with its tool_result by `tool_use_id`. Calls without a
  * result are not candidates (there is nothing to drop yet).
@@ -62,6 +70,7 @@ export function isPinned(
 export function collectToolCalls(
   messages: readonly Message[],
   preserveRecentMessages: number,
+  previewChars = 0,
 ): ToolCall[] {
   const results = new Map<string, { index: number; result: ToolResult }>();
   messages.forEach((message, index) => {
@@ -82,6 +91,9 @@ export function collectToolCalls(
         callIndex,
         resultIndex: found.index,
         resultChars: found.result.text.length,
+        ...(previewChars > 0
+          ? { resultPreview: resultPreview(found.result.text, previewChars) }
+          : {}),
         isError: found.result.isError ?? false,
         pinned:
           isPinned(callIndex, messages.length, preserveRecentMessages) ||
@@ -302,3 +314,298 @@ export function fitState(
     `history too large for Jev (~${tokens} tokens after truncation, limit ${options.maxStateTokens})`,
   );
 }
+
+
+
+type DialogueText = {
+  i: number;
+  role: Message['role'];
+  text: string;
+};
+
+function dialogueTexts(messages: readonly Message[]): DialogueText[] {
+  const out: DialogueText[] = [];
+  messages.forEach((message, i) => {
+    if (message.text.trim().length === 0) return;
+    out.push({ i, role: message.role, text: message.text });
+  });
+  return out;
+}
+
+function indexExcerpt(text: string, chars: number): string {
+  const flat = text.replace(/\s+/g, ' ').trim();
+  if (chars <= 0 || flat.length <= chars) return chars <= 0 ? '' : flat;
+  const head = Math.max(1, Math.ceil(chars * 0.6));
+  const tail = Math.max(1, chars - head);
+  return flat.slice(0, head) + ' … ' + flat.slice(-tail);
+}
+
+function dialogueIndex(
+  dialogue: readonly DialogueText[],
+  chars: number,
+): Array<{ i: number; role: Message['role']; excerpt: string; chars: number }> {
+  return dialogue.map((entry) => ({
+    i: entry.i,
+    role: entry.role,
+    excerpt: indexExcerpt(entry.text, chars),
+    chars: entry.text.length,
+  }));
+}
+
+function toolIndex(calls: readonly ToolCall[]): string[] {
+  return calls.map((call) => compactCall(call));
+}
+
+function textEntry(entry: DialogueText): HistoryEntry {
+  return { i: entry.i, role: entry.role, text: entry.text };
+}
+
+function recentAssistantAnchor(
+  assistants: readonly DialogueText[],
+  tokenBudget: number,
+): DialogueText[] {
+  const picked: DialogueText[] = [];
+  let used = 0;
+  for (let i = assistants.length - 1; i >= 0; i -= 1) {
+    const entry = assistants[i]!;
+    const cost = estimateTokens(JSON.stringify(textEntry(entry))) + 1;
+    if (picked.length > 0 && used + cost > tokenBudget) break;
+    picked.push(entry);
+    used += cost;
+    if (used >= tokenBudget) break;
+  }
+  return picked.reverse();
+}
+
+type ShardBuildOptions = {
+  indexChars: number;
+  includeToolIndex: boolean;
+  recentAnchor: readonly DialogueText[];
+};
+
+function buildShardState(
+  messages: readonly Message[],
+  calls: readonly ToolCall[],
+  batch: readonly ToolCall[],
+  selectedHistoricalAssistant: readonly DialogueText[],
+  options: Pick<ResolvedCompactOptions, 'goal'>,
+  build: ShardBuildOptions,
+  shardLabel: string,
+): FittedState {
+  const dialogue = dialogueTexts(messages);
+  const users = dialogue.filter((entry) => entry.role === 'user');
+  const selected = new Map<number, DialogueText>();
+  for (const entry of users) selected.set(entry.i, entry);
+  for (const entry of build.recentAnchor) selected.set(entry.i, entry);
+  for (const entry of selectedHistoricalAssistant) selected.set(entry.i, entry);
+
+  const history = [...selected.values()]
+    .sort((a, b) => a.i - b.i)
+    .map(textEntry);
+  const state: CompactionState = {
+    context: STATE_CONTEXT,
+    goal: options.goal || goalFromMessages(messages),
+    history,
+    dialogue_index: dialogueIndex(dialogue, build.indexChars),
+    evaluating: batch.map((call) => call.id),
+    shard: shardLabel,
+  };
+  if (build.includeToolIndex) state.tool_index = toolIndex(calls);
+  return {
+    state,
+    tokens: estimateTokens(JSON.stringify(state)),
+    stage:
+      'all-user verbatim + recent assistant + assistant shard' +
+      (build.includeToolIndex ? ' + tool index' : '') +
+      ' + dialogue index',
+  };
+}
+
+function stateFits(state: FittedState, tokenLimit: number): boolean {
+  return state.tokens <= tokenLimit;
+}
+
+/**
+ * Creates multiple evidence states for one target batch.
+ *
+ * Preferred mode repeats every user message verbatim in every request. All
+ * assistant messages are represented in every request by dialogue_index; recent
+ * assistant text is repeated verbatim, while older assistant text is partitioned
+ * into verbatim shards. Thus every assistant message is seen in full by at least
+ * one request for this target batch.
+ *
+ * If the mandatory all-user base itself exceeds the physical state limit, this
+ * function fails explicitly rather than silently abridging user instructions.
+ */
+export function fitBatchStates(
+  messages: readonly Message[],
+  calls: readonly ToolCall[],
+  batch: readonly ToolCall[],
+  options: Pick<ResolvedCompactOptions, 'maxStateTokens' | 'goal'>,
+  tokenLimit: number = options.maxStateTokens,
+): FittedState[] {
+  const dialogue = dialogueTexts(messages);
+  const assistants = dialogue.filter((entry) => entry.role === 'assistant');
+
+  // Keep a useful fresh assistant anchor in every shard, but leave most of the
+  // state budget available for one historical full-text slice.
+  const anchorBudget = Math.max(1_000, Math.min(6_000, Math.floor(tokenLimit * 0.22)));
+  const recent = recentAssistantAnchor(assistants, anchorBudget);
+
+  // Start rich, then remove only global indexes/anchor detail when necessary.
+  let build: ShardBuildOptions = {
+    indexChars: 120,
+    includeToolIndex: true,
+    recentAnchor: recent,
+  };
+
+  const base = (): FittedState =>
+    buildShardState(messages, calls, batch, [], options, build, 'base');
+
+  // Aim to leave at least ~25% of state capacity for a historical full-text
+  // slice; this is a soft target, not a content deletion rule.
+  const desiredBase = Math.floor(tokenLimit * 0.75);
+  let probe = base();
+  if (probe.tokens > desiredBase) {
+    build = { ...build, includeToolIndex: false };
+    probe = base();
+  }
+  if (probe.tokens > desiredBase) {
+    build = { ...build, indexChars: 72 };
+    probe = base();
+  }
+  while (probe.tokens > desiredBase && build.recentAnchor.length > 1) {
+    build = { ...build, recentAnchor: build.recentAnchor.slice(1) };
+    probe = base();
+  }
+  if (probe.tokens > tokenLimit) {
+    build = { ...build, indexChars: 36, includeToolIndex: false };
+    probe = base();
+  }
+  while (probe.tokens > tokenLimit && build.recentAnchor.length > 0) {
+    build = { ...build, recentAnchor: build.recentAnchor.slice(1) };
+    probe = base();
+  }
+  if (probe.tokens > tokenLimit) {
+    throw new Error(
+      'all user messages plus the minimal global dialogue index exceed the Jev state limit (~' +
+        probe.tokens +
+        ' tokens, limit ' +
+        tokenLimit +
+        '); cannot preserve every user message verbatim in each shard',
+    );
+  }
+
+  const finalRecentIds = new Set(build.recentAnchor.map((entry) => entry.i));
+  const historical = assistants.filter((entry) => !finalRecentIds.has(entry.i));
+
+  // No historical assistant text: one complete state is enough.
+  if (historical.length === 0) {
+    probe.state.shard = '1/1: all assistant text in recent anchor';
+    probe.tokens = estimateTokens(JSON.stringify(probe.state));
+    return [probe];
+  }
+
+  const groups: DialogueText[][] = [];
+  let current: DialogueText[] = [];
+
+  const fitsGroup = (group: readonly DialogueText[]): FittedState =>
+    buildShardState(messages, calls, batch, group, options, build, 'planning');
+
+  for (const entry of historical) {
+    const proposed = [...current, entry];
+    const test = fitsGroup(proposed);
+    if (stateFits(test, tokenLimit)) {
+      current = proposed;
+      continue;
+    }
+
+    if (current.length > 0) {
+      groups.push(current);
+      // One-message overlap gives local continuity across shard boundaries.
+      const overlap = current.slice(-1);
+      const withOverlap = [...overlap, entry];
+      if (stateFits(fitsGroup(withOverlap), tokenLimit)) current = withOverlap;
+      else current = [entry];
+    } else {
+      current = [entry];
+    }
+
+    if (!stateFits(fitsGroup(current), tokenLimit)) {
+      // For one unusually large assistant message, remove every optional global
+      // structure before conceding that the message itself cannot fit.
+      const minimal: ShardBuildOptions = {
+        indexChars: 24,
+        includeToolIndex: false,
+        recentAnchor: [],
+      };
+      const single = buildShardState(
+        messages,
+        calls,
+        batch,
+        [entry],
+        options,
+        minimal,
+        'single-large-message',
+      );
+      if (!stateFits(single, tokenLimit)) {
+        throw new Error(
+          'one assistant text message cannot fit verbatim with all user messages in a Jev shard (~' +
+            single.tokens +
+            ' tokens, limit ' +
+            tokenLimit +
+            ')',
+        );
+      }
+      if (groups.length === 0 || groups.at(-1) !== current) {
+        groups.push([entry]);
+      }
+      current = [];
+    }
+  }
+  if (current.length > 0) groups.push(current);
+
+  const states = groups.map((group, index) => {
+    const state = buildShardState(
+      messages,
+      calls,
+      batch,
+      group,
+      options,
+      build,
+      String(index + 1) + '/' + String(groups.length) + ': historical assistant slice',
+    );
+    if (!stateFits(state, tokenLimit)) {
+      throw new Error(
+        'internal shard planner exceeded Jev state limit (~' +
+          state.tokens +
+          ' tokens, limit ' +
+          tokenLimit +
+          ')',
+      );
+    }
+    return state;
+  });
+
+  return states;
+}
+
+/** Backward-compatible single-state helper for short conversations. */
+export function fitBatchState(
+  messages: readonly Message[],
+  calls: readonly ToolCall[],
+  batch: readonly ToolCall[],
+  options: Pick<ResolvedCompactOptions, 'maxStateTokens' | 'goal'>,
+  tokenLimit: number = options.maxStateTokens,
+): FittedState {
+  const states = fitBatchStates(messages, calls, batch, options, tokenLimit);
+  if (states.length !== 1) {
+    throw new Error(
+      'conversation requires ' +
+        states.length +
+        ' Jev evidence shards; use fitBatchStates() instead of fitBatchState()',
+    );
+  }
+  return states[0]!;
+}
+

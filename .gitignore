@@ -1,4 +1,10 @@
-node_modules
-dist
+node_modules/
+dist/
+coverage/
 .env
-demo/JevDemo/build
+.env.*
+*.env
+*.log
+*.bak
+*.tmp
+demo/JevDemo/build/
