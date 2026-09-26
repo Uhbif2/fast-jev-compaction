@@ -1,6 +1,6 @@
 {
   "name": "fast-jev-compaction-local",
-  "version": "0.3.0-local.13",
+  "version": "0.3.0-local.14",
   "description": "Continuous, verbatim context compaction for LLM agents using TypeSafe's Jev model.",
   "type": "module",
   "license": "MIT",

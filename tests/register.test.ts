@@ -43,6 +43,7 @@ function jevAnswer(noul: number) {
 }
 
 function engine(setup: {
+  sessionMessages?: SessionMessage[];
   fetch?: (url: string, init?: { body?: string }) => Promise<unknown>;
   context?: () => { tokens?: number; percent?: number; window: number };
   compact?: () => Promise<unknown>;
@@ -51,13 +52,20 @@ function engine(setup: {
   const handlers: Record<string, Handler> = {};
   const toasts: string[] = [];
   const order: string[] = [];
+  const stored = new Map<string, unknown>();
   const $ = {
+    store: {
+      get: async (key: string) => stored.get(key),
+      set: async (key: string, value: unknown) => void stored.set(key, JSON.parse(JSON.stringify(value))),
+    },
     ui: { log: () => {}, toast: (text: string) => void toasts.push(text) },
     env: { get: async () => 'k' },
     settings: { read: async () => ({}) },
     clock: { sleep: async () => {} },
     http: { fetch: setup.fetch ?? jevAnswer(0.001) },
     session: {
+      id: async () => 'session-1',
+      messages: async () => setup.sessionMessages ?? [],
       usage: async () => ({ context: setup.context?.() ?? { window: 1_000_000 }, rateLimits: [] }),
       compact: async () => {
         order.push('compact');
@@ -71,7 +79,7 @@ function engine(setup: {
     }) as never,
     { preserveRecentMessages: 1, compactAtPercent: 30, ...setup.options } as never,
   );
-  return { handlers, toasts, order, $ };
+  return { handlers, toasts, order, $, stored };
 }
 
 describe('session.compact never hands over to the Claude summary', () => {
@@ -108,8 +116,62 @@ describe('session.compact never hands over to the Claude summary', () => {
   it('returns the compacted messages, tagged with the trigger', async () => {
     const { handlers, $, toasts } = engine({});
     const result = await handlers['session.compact']!($, { trigger: 'plugin', messages: transcript() }, nextNeverCalled);
-    expect(result.messages.map((m: SessionMessage) => m.handle)).toEqual(['h0', 'h3', 'h4']);
+    // User text keeps the engine's own object; assistant text is rebuilt.
+    expect(result.messages.map((m: SessionMessage) => m.handle)).toEqual(['h0', undefined, 'h4']);
     expect(toasts.at(-1)).toContain(`fast-jev ${LOCAL_BUILD} [plugin]`);
+  });
+
+  it('drops old thinking even when Jev keeps every tool result, and says the size is a bound', async () => {
+    const { handlers, $, toasts } = engine({ fetch: jevAnswer(0.99), context: () => ({ tokens: 400_000, percent: 40, window: 1_000_000 }) });
+    const messages = transcript();
+    messages.splice(1, 0, message('assistant', '', { handle: 'thinking' }));
+    const result = await handlers['session.compact']!($, { trigger: 'manual', messages }, nextNeverCalled);
+    expect(result.messages).toBeDefined();
+    expect(result.messages.some((m: SessionMessage) => m.handle === 'thinking')).toBe(false);
+    expect(toasts.at(-1)).toMatch(/context 400k → under \d+k tokens \(−\d+ of messages and 1 thinking block\(s\) of unknown size/);
+  });
+
+  it('heals a transcript an earlier compaction doubled, without asking Jev', async () => {
+    let asked = 0;
+    const { handlers, $, toasts } = engine({ fetch: async () => { asked += 1; return { status: 500, ok: false, text: '', headers: {} }; } });
+    const once = [
+      message('user', 'Check a.ts.', { handle: 'h0' }),
+      message('assistant', '', { toolUses: [{ tool_use_id: 't1', tool: 'Read', input: { file_path: 'a.ts' }, text: 'short' }], handle: 'h1' }),
+      message('user', '', { toolResults: [{ tool_use_id: 't1', text: 'short', isError: false }], handle: 'h2' }),
+      message('assistant', 'a.ts is fine.', { handle: 'h3' }),
+    ];
+    const doubled = [...once, ...once.slice(1).map((m) => ({ ...m, handle: `${m.handle}-copy` })), message('user', 'next', { handle: 'h9' })];
+    const result = await handlers['session.compact']!($, { trigger: 'manual', messages: doubled }, nextNeverCalled);
+    expect(result.skip).toBeUndefined();
+    expect(result.messages.flatMap((m: SessionMessage) => m.toolUses.map((t) => t.tool_use_id))).toEqual(['t1']);
+    expect(result.messages.filter((m: SessionMessage) => m.text === 'a.ts is fine.')).toHaveLength(1);
+    expect(asked).toBe(0);
+    expect(toasts.at(-1)).toMatch(/no Jev request needed; 1 duplicated call\(s\) removed; 1 duplicated text\(s\) removed/);
+  });
+
+  it('refuses while a call still waits for its result', async () => {
+    const { handlers, $ } = engine({});
+    const messages = [...transcript().slice(0, 4), message('assistant', '', { toolUses: [{ tool_use_id: 't9', tool: 'Bash', input: {} }], handle: 'h9' })];
+    const result = await handlers['session.compact']!($, { trigger: 'manual', messages }, nextNeverCalled);
+    expect(result.skip).toMatch(/turn is in progress/);
+  });
+
+  it('keeps a message the user sent mid-turn as text at the next compaction', async () => {
+    const history = transcript();
+    const { handlers, $, stored } = engine({ sessionMessages: history.slice(0, 2) });
+    const typed = await handlers['prompt.submit']!(
+      $,
+      { text: 'also look at b.ts', turnId: 'turn-1', wait: false, origin: { kind: 'sdk' } },
+      async (e: { text: string }) => ({ text: e.text }),
+    );
+    expect(typed).toEqual({ text: 'also look at b.ts' });
+    await handlers['prompt.submit']!($, { text: 'idle prompt', wait: false, origin: { kind: 'sdk' } }, async (e: { text: string }) => ({ text: e.text }));
+    expect((stored.get('queued-prompts') as Record<string, unknown[]>)['session-1']).toHaveLength(1);
+
+    const result = await handlers['session.compact']!($, { trigger: 'manual', messages: history }, nextNeverCalled);
+    const texts = result.messages.map((m: SessionMessage) => m.text);
+    expect(texts.some((t: string) => t.endsWith('while you were working:\nalso look at b.ts'))).toBe(true);
+    expect(stored.get('queued-prompts')).toEqual({});
   });
 
   it('never rejects, even when the UI throws', async () => {
@@ -184,7 +246,7 @@ describe('auto-compaction from turn.complete', () => {
     expect(result.messages).toBeDefined();
     tokens = 180_000;
     await handlers['turn.complete']!($, { turnId: '2' }, next(order));
-    expect(toasts.at(-1)).toMatch(/first request after compaction carried 180k tokens \(before: 400k\)/);
+    expect(toasts.at(-1)).toMatch(/first request after compaction carried 180k tokens \(before: 400k; −220k, −55%/);
   });
 });
 

@@ -116,18 +116,47 @@ claude plugin validate .claude-plugin/plugin.json
 Toast'ы плагина начинаются с `fast-jev <LOCAL_BUILD> [<trigger>]` (`manual` — `/compact`,
 `plugin` — автокомпакция плагина). Отказ и no-op приходят одной строкой причины.
 
+Итог состоявшейся компакции (с local.14):
+
+```text
+fast-jev 0.3.0-local.14 [manual]: done in 2 s, no summary; context 378k → under 334k tokens
+(−44k of messages and 78 thinking block(s) of unknown size; the next request shows the exact size).
+Jev checked 55 of 55 candidate(s): 27 result(s) truncated, 4 call(s) dropped, 24 kept in 2 request(s); …
+```
+
+- `context U → under A` — U реальный размер последнего запроса, A верхняя граница после: из U
+  вычтено то, что ушло из видимых сообщений; thinking уходит тоже, но плагину его размер не виден;
+- `messages ~X → ~Y` вместо этого — сессия была переоткрыта с задвоенной историей, и последний
+  замер устарел; рядом стоит `N duplicated call(s) removed`;
+- `no Jev request needed` — сократились только thinking и дубли, кандидатов для Jev не было.
+
 **Эффект проверять по следующему запросу, а не по boundary.** После компакции, которая
 состоялась, плагин на следующем `turn.complete` показывает «first request after compaction
-carried N tokens (before: M)». Это `usage` реального запроса к API. В `.jsonl` то же видно у
-первого ответа assistant после boundary: `cache_read_input_tokens + cache_creation_input_tokens
-+ input_tokens`.
+carried N tokens (before: M; −D, −P%, …)». Это `usage` реального запроса к API, в него входят и
+новые сообщения этого хода. В `.jsonl` то же видно у первого ответа assistant после boundary:
+`cache_read_input_tokens + cache_creation_input_tokens + input_tokens`.
 
-`preTokens`/`postTokens` у boundary эффекта не доказывают:
+`preTokens`/`postTokens` у boundary и строка движка «compacted …» эффекта не показывают:
 
+- `postTokens` движок считает сам и только по содержимому сообщений — без системного промпта,
+  схем инструментов, вложений и thinking; `preTokens` — реальный размер. Их разность завышает
+  эффект в разы (26.09: «204k → 71k», фактически 200k → 164k). Хук её не переопределяет;
 - `preTokens` может означать только хвост после предыдущего boundary;
-- `postTokens` считает то, что вернул хук, даже когда до local.8 он возвращал исходные сообщения
-  после ошибки (21.09: boundary «541k → 219k», а следующий запрос — 544k);
-- строка UI вроде `from 2.5k tokens` поэтому не доказывает, что весь контекст был 2.5k.
+- до local.8 хук при ошибке возвращал исходные сообщения, а boundary всё равно писался
+  (21.09: «541k → 219k», а следующий запрос — 544k).
+
+## Целостность после компакции
+
+Движок пишет компакцию хука копиями сообщений (см. CONTEXT.md, local.14). Проверка записанного и
+того, что загрузит переоткрытие сессии, без вывода содержимого:
+
+```text
+npx tsx scripts/verify-transcript.ts <session.jsonl>
+```
+
+Чисто, когда `linksIntoHistory`, `sharedMessageIds`, `recoveredOnReload` и дубли равны 0, а
+`chainStartsAfterBoundary` — true (код выхода 0). Транскрипт, записанный до local.14, эту проверку
+не проходит; первая компакция local.14 его лечит.
 
 ## Реплей и живая проверка
 
@@ -145,7 +174,19 @@ npx tsx scripts/replay.ts <transcript.jsonl> --baseline <installed-plugin-root>
 node scripts/smoke.mjs <bundled-claude.exe>
 ```
 
-Она создаёт отдельный fork, запускает `/compact` установленным плагином и проверяет сохранность
+Живая проверка на копии реальной сессии (Jev-запросы идут, модель не вызывается, исходная сессия
+и `settings.json` не меняются):
+
+```text
+node scripts/live-compact.mjs <bundled-claude.exe> <session.jsonl> [--rows N] [opt:keepThreshold=0.65]
+```
+
+`--rows N` берёт первые N строк — например, состояние перед boundary; `opt:` меняет опцию плагина
+только для этого прогона. Скрипт печатает уведомления плагина (включая оценки Jev по каждому
+вызову) и результат `verify-transcript`. Копии и форки лежат в `.git/fastjev-live` и в
+`~/.claude/projects/<project>/`.
+
+Синтетическая `smoke.mjs` создаёт отдельный fork, запускает `/compact` установленным плагином и проверяет сохранность
 всех текстов, нужного результата и отсутствие Claude summary. Credentials читает только сам
 Claude. `--source` меняет identity на inline-plugin и потому может не получить sensitive apiKey;
 для сетевой приёмки использовать установленную версию. Настройки основной сессии не меняются.
