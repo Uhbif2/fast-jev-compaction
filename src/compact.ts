@@ -37,6 +37,7 @@ export const DEFAULT_OPTIONS: ResolvedCompactOptions = {
   resultPreviewChars: 1_000,
   compactAssistantText: false,
   pages: {},
+  cutTokens: 0,
 };
 
 /** TypeSafe Jev 1.13 physical limits. */
@@ -81,6 +82,7 @@ export function resolveOptions(options: CompactOptions = {}): ResolvedCompactOpt
         ? options.compactAssistantText
         : DEFAULT_OPTIONS.compactAssistantText,
     pages: options.pages ?? DEFAULT_OPTIONS.pages,
+    cutTokens: Math.max(0, finite(options.cutTokens, DEFAULT_OPTIONS.cutTokens)),
   };
 }
 
@@ -479,6 +481,46 @@ export function truncatedResultText(
   return shortened.length < text.length ? shortened : text;
 }
 
+/**
+ * Meets `cutTokens` by paging out more results, lowest Jev score first (on a
+ * tie the larger first): Jev's order is informative where its absolute
+ * scores are not. Only answered candidates qualify, only their result body
+ * goes (the call record stays), and a pinned call never does. Returns how
+ * many decisions it changed; they are changed in place.
+ */
+function pageForTarget(
+  decisions: CallDecision[],
+  calls: readonly ToolCall[],
+  answers: ReadonlyMap<string, CallAnswer>,
+  options: ResolvedCompactOptions,
+): number {
+  if (options.cutTokens <= 0) return 0;
+  const byId = new Map(calls.map((call) => [call.id, call]));
+  const keep = options.truncateHeadChars * 2 + 250;
+  const saving = (call: ToolCall): number => Math.max(0, call.resultChars - keep);
+  let cut = 0;
+  for (const decision of decisions) {
+    const call = byId.get(decision.id)!;
+    if (decision.action === 'drop_call') cut += call.resultChars + JSON.stringify(call.input).length;
+    else if (decision.action === 'drop_result') cut += saving(call);
+  }
+  // Tool output runs about 3 characters to a token (code, logs, paths).
+  const target = options.cutTokens * 3;
+  if (cut >= target) return 0;
+  const open = decisions
+    .filter((d) => d.action === 'keep' && d.reason === 'kept' && answers.has(d.id) && saving(byId.get(d.id)!) > MIN_SAVING_CHARS)
+    .sort((a, b) => a.keepResult - b.keepResult || saving(byId.get(b.id)!) - saving(byId.get(a.id)!));
+  let changed = 0;
+  for (const decision of open) {
+    if (cut >= target) break;
+    decision.action = 'drop_result';
+    decision.reason = 'paged_for_target';
+    cut += saving(byId.get(decision.id)!);
+    changed += 1;
+  }
+  return changed;
+}
+
 /** Below this many characters a removable call is not worth a Jev question. */
 const MIN_SAVING_CHARS = 400;
 
@@ -809,6 +851,7 @@ export async function compact(
   const decisions = calls.map((call) =>
     decideCall(call, answers.get(call.id) ?? { keepCall: 1, keepResult: 1 }, resolved),
   );
+  const pagedForTarget = pageForTarget(decisions, calls, answers, resolved);
   const resultScores: CompactResult['stats']['resultScores'] = [0, 0, 0, 0, 0];
   for (const call of toolCandidates) {
     const score = answers.get(call.id)?.keepResult;
@@ -845,6 +888,7 @@ export async function compact(
     assistantTextDecisions,
     stats: {
       inputsPaged: writers.paged,
+      pagedForTarget,
       inputCharsSaved: writers.charsSaved,
       messagesBefore: messages.length,
       messagesAfter: kept.length,

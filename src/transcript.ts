@@ -110,6 +110,36 @@ export function dedupeReplayedHistory<T extends Message>(messages: readonly T[])
   return { messages: out, toolCalls, texts };
 }
 
+/** Local commands whose invocation and output carry nothing for the model once they are old. */
+const NOISE_COMMANDS = new Set([
+  '/compact', '/reload-plugins', '/context', '/cost', '/usage', '/model', '/effort', '/fast', '/status',
+  '/config', '/permissions', '/doctor', '/hooks', '/plugins', '/plugin', '/mcp', '/help', '/clear',
+]);
+const OUTPUT_BLOCK = /<(local-command-caveat|local-command-stdout|local-command-stderr)>[\s\S]*?<\/\1>/g;
+const INVOCATION = /^\s*<command-name>(\/[\w:-]+)<\/command-name>\s*<command-message>[\s\S]*?<\/command-message>\s*<command-args>([\s\S]*?)<\/command-args>\s*$/;
+
+/**
+ * Engine text that is not the user's: the caveat, stdout and stderr of local
+ * commands, and the bare invocation of a built-in one (`/compact` without
+ * instructions). An old one only misleads: a "compaction blocked" from an
+ * hour ago reads as the verdict on the compaction just made.
+ */
+export function isCommandNoise(message: Message): boolean {
+  if (message.role !== 'user' || isToolResultRow(message)) return false;
+  const text = message.text.trim();
+  if (!text) return false;
+  if (text.replace(OUTPUT_BLOCK, '').trim() === '') return true;
+  const invocation = INVOCATION.exec(text);
+  return !!invocation && NOISE_COMMANDS.has(invocation[1]!) && invocation[2]!.trim() === '';
+}
+
+/** Drops old command noise; the newest messages stay as they are. */
+export function dropCommandNoise<T extends Message>(messages: readonly T[], preserveRecentMessages: number): { messages: T[]; dropped: number } {
+  const keepFrom = messages.length - Math.max(0, preserveRecentMessages);
+  const out = messages.filter((message, index) => index >= keepFrom || !isCommandNoise(message));
+  return { messages: out, dropped: messages.length - out.length };
+}
+
 /** Assistant rows with no text and no tool call: thinking the engine keeps as a row of its own. */
 export function thinkingOnlyRows(messages: readonly Message[]): number {
   return messages.filter((m) => m.role === 'assistant' && m.text.trim().length === 0 && m.toolUses.length === 0).length;

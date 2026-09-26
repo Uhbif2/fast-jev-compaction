@@ -76,7 +76,7 @@ export interface CallDecision extends CallAnswer {
   tool_use_id?: string;
   tool: string;
   action: CallAction;
-  reason: 'pinned' | 'kept' | 'result_dropped' | 'call_dropped';
+  reason: 'pinned' | 'kept' | 'result_dropped' | 'call_dropped' | 'paged_for_target';
 }
 
 export interface AssistantTextDecision {
@@ -153,6 +153,14 @@ export interface CompactOptions {
    * note: `page(tool_use_id)` is a file the host writes, `transcript` the
    * session's .jsonl. Absent, the note names neither path.
    */
+  /**
+   * Tokens of visible content the compaction should take out at least. Jev's
+   * scores are well ordered but poorly calibrated (most sit in 0.5–0.7), so
+   * a threshold alone either keeps nearly everything or nearly nothing.
+   * With a target, results are paged out lowest score first until it is met;
+   * paging keeps the whole output one file read away, so this loses nothing.
+   */
+  cutTokens?: number;
   pages?: {
     page?: (toolUseId: string) => string | undefined;
     /** The page holding the whole input of an old file-writer call; its long fields are paged out when present. */
@@ -173,6 +181,7 @@ export interface ResolvedCompactOptions {
   resultPreviewChars: number;
   compactAssistantText: boolean;
   pages: NonNullable<CompactOptions['pages']>;
+  cutTokens: number;
 }
 
 export interface CompactResult {
@@ -185,6 +194,8 @@ export interface CompactResult {
   stats: {
     /** Old file-writer inputs paged out, and the characters that took out. */
     inputsPaged: number;
+    /** Results paged out beyond the threshold to reach cutTokens. */
+    pagedForTarget: number;
     inputCharsSaved: number;
     messagesBefore: number;
     messagesAfter: number;

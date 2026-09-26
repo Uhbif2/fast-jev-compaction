@@ -208,6 +208,24 @@ describe('session.compact never hands over to the Claude summary', () => {
     expect(toasts.some((t) => /1 page-in\(s\) since the last compaction/.test(t))).toBe(true);
   });
 
+  it('pages out an old Write input to its own page', async () => {
+    const { handlers, $, toasts, written } = engine({ fetch: jevAnswer(0.99) });
+    const content = 'const x = 1;\n'.repeat(300);
+    const messages = [
+      message('user', 'Write it.', { handle: 'h0' }),
+      message('assistant', '', { toolUses: [{ tool_use_id: 'w1', tool: 'Write', input: { file_path: 'a.ts', content }, text: 'ok' }], handle: 'h1' }),
+      message('user', '', { toolResults: [{ tool_use_id: 'w1', text: 'ok', isError: false }], handle: 'h2' }),
+      message('assistant', 'Written.', { handle: 'h3' }),
+      message('user', 'next', { handle: 'h4' }),
+    ];
+    const result = await handlers['session.compact']!($, { trigger: 'manual', messages }, nextNeverCalled);
+    const page = 'C:/Users/me/.claude/fast-jev-pages/session-1/w1.input.txt';
+    expect(written.get(page)).toContain(content);
+    const input = result.messages[1].toolUses[0].input.content as string;
+    expect(input).toContain(`the whole input is in ${page}`);
+    expect(toasts.at(-1)).toMatch(/1 old Write\/Edit input\(s\) paged out/);
+  });
+
   it('names the transcript when a page cannot be written', async () => {
     const { handlers, $ } = engine({ fetch: jevAnswer(0.001), failWrites: true });
     const result = await handlers['session.compact']!($, { trigger: 'manual', messages: bashTranscript() }, nextNeverCalled);

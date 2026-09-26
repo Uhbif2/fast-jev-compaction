@@ -567,3 +567,29 @@ describe('HTTP client', () => {
     ).rejects.toThrow(/TYPESAFE_API_KEY/);
   });
 });
+
+describe('size target', () => {
+  it('pages out more results, lowest score first, until the target is met', async () => {
+    const out = (n: number) => `line ${n}\n`.repeat(400);
+    const messages: Message[] = [{ role: 'user', text: 'go', toolUses: [] }];
+    for (const n of [1, 2, 3]) {
+      messages.push({ role: 'assistant', text: '', toolUses: [{ tool_use_id: `u${n}`, tool: 'Bash', input: { command: `run ${n}` }, text: out(n) }] });
+      messages.push({ role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: `u${n}`, text: out(n), isError: false }] });
+    }
+    messages.push({ role: 'assistant', text: 'done', toolUses: [] }, { role: 'user', text: 'next', toolUses: [] });
+    const scores: Record<string, number> = { t1: 0.7, t2: 0.6, t3: 0.9 };
+    const asker = {
+      ask: async (_s: unknown, questions: Record<string, unknown>) => ({
+        answers: Object.fromEntries(Object.keys(questions).map((k) => [k, { noul: scores[k.replace(/^\w+_/, '')] ?? 1 }])),
+      }),
+    };
+    const none = await compact(messages, asker as never, { preserveRecentMessages: 2 });
+    expect(none.stats.pagedForTarget).toBe(0);
+    const one = await compact(messages, asker as never, { preserveRecentMessages: 2, cutTokens: 500 });
+    expect(one.stats.pagedForTarget).toBe(1);
+    expect(one.decisions.find((d) => d.reason === 'paged_for_target')?.id).toBe('t2');
+    const all = await compact(messages, asker as never, { preserveRecentMessages: 2, cutTokens: 100_000 });
+    expect(all.stats.pagedForTarget).toBe(3);
+    expect(all.decisions.every((d) => d.action !== 'drop_call')).toBe(true);
+  });
+});
