@@ -14,6 +14,7 @@ import { buildJevRequest, DEFAULT_MODEL, parseJevResponse } from '../src/request
 import { writerInputCandidates } from '../src/inputs.js';
 import {
   dedupeReplayedHistory,
+  dropCommandNoise,
   engineMessages,
   restoreQueuedPrompts,
   thinkingOnlyRows,
@@ -36,6 +37,7 @@ import type {
 
 const HOOK_DEFAULTS = {
   compactAtPercent: 60,
+  targetPercent: 15,
   minReductionRatio: 0,
   compactAssistantText: false,
   model: DEFAULT_MODEL,
@@ -69,7 +71,7 @@ const timerDeadline: DeadlineWait = (ms) => {
   return { expired, cancel: () => clearTimeout(timer) };
 };
 
-export const LOCAL_BUILD = '0.3.0-local.14';
+export const LOCAL_BUILD = '0.3.0-local.15';
 
 export const JEV_MAX_ATTEMPTS = 6;
 const JEV_RETRY_DELAYS_MS = [1_000, 2_000, 4_000, 8_000, 15_000];
@@ -115,6 +117,8 @@ export function retryAfterMs(headers: Record<string, string> | undefined, now = 
 export type HookConfig = CompactOptions & {
   apiKey?: string;
   compactAtPercent: number;
+  /** A compaction aims to bring the context to this share of the window; 0 turns the target off. */
+  targetPercent: number;
   minReductionRatio: number;
   model: string;
 };
@@ -147,6 +151,7 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
   const config: HookConfig = {
     ...numbers,
     compactAtPercent: optionNumber(options, 'compactAtPercent', HOOK_DEFAULTS.compactAtPercent),
+    targetPercent: optionNumber(options, 'targetPercent', HOOK_DEFAULTS.targetPercent),
     minReductionRatio: optionNumber(
       options,
       'minReductionRatio',
@@ -302,8 +307,9 @@ export function summarize(result: CompactResult): string {
   const parts = [
     stats.resultsDropped > 0 ? `${stats.resultsDropped} result(s) truncated` : '',
     stats.callsDropped > 0 ? `${stats.callsDropped} call(s) dropped` : '',
-    stats.asked > 0 ? `${stats.asked - stats.resultsDropped - stats.callsDropped} kept` : '',
+    stats.asked > 0 ? `${stats.asked - stats.resultsDropped - stats.callsDropped - stats.pagedForTarget} kept` : '',
     stats.deferred > 0 ? `${stats.deferred} left for the next pass` : '',
+    stats.pagedForTarget > 0 ? `${stats.pagedForTarget} more paged out to reach the size target` : '',
     stats.assistantTextsDropped > 0 ? `${stats.assistantTextsDropped} assistant text(s) dropped` : '',
   ].filter(Boolean);
   const inputs = stats.inputsPaged > 0 ? `; ${stats.inputsPaged} old Write/Edit input(s) paged out` : '';
@@ -521,7 +527,7 @@ export async function writePages(
   const written = new Set<string>();
   for (const id of ids) {
     const text = texts.get(id);
-    if (text === undefined || text.length > PAGE_MAX_CHARS || !/^[A-Za-z0-9_-]+$/.test(id)) continue;
+    if (text === undefined || text.length > PAGE_MAX_CHARS || !/^[A-Za-z0-9_-]+(\.input)?$/.test(id)) continue;
     try {
       await $.fs.write(`${dir}/${id}.txt`, text);
       written.add(id);
@@ -623,11 +629,13 @@ export const register: Register = (on: On, options: PluginOptions) => {
       }
       const queued = sessionId ? await readQueued($, sessionId) : [];
       const restoring = restoreQueuedPrompts(deduped.messages, queued);
-      const input = restoring.messages;
+      const noise = dropCommandNoise(restoring.messages, resolveOptions(configured).preserveRecentMessages);
+      const input = noise.messages;
       const repairs = [
         deduped.toolCalls > 0 ? `${deduped.toolCalls} duplicated call(s) removed` : '',
         deduped.texts > 0 ? `${deduped.texts} duplicated text(s) removed` : '',
         restoring.restored.length > 0 ? `${restoring.restored.length} mid-turn user message(s) kept as text` : '',
+        noise.dropped > 0 ? `${noise.dropped} old command output(s) dropped` : '',
       ].filter(Boolean);
       const thinkingRows = thinkingOnlyRows(input);
       // Refuses now, before any Jev request, when a call still waits for its result.
@@ -678,9 +686,12 @@ export const register: Register = (on: On, options: PluginOptions) => {
       }
 
       let tokensBefore: number | undefined;
+      let window: number | undefined;
       if (main) {
         try {
-          tokensBefore = (await $.session.usage()).context.tokens;
+          const { context } = await $.session.usage();
+          tokensBefore = context.tokens;
+          window = context.window;
         } catch {
           // Only the size report needs it.
         }
@@ -703,6 +714,12 @@ export const register: Register = (on: On, options: PluginOptions) => {
         };
         const goal = compactionGoal(input, configured, event.instructions);
         if (goal) config.goal = goal;
+        // The target counts from the last measured context; after a reload
+        // that doubled the history the messages themselves are the measure.
+        const measured = deduped.toolCalls + deduped.texts > 0 ? visibleTokens(event.messages) : tokensBefore;
+        if (measured !== undefined && window && configured.targetPercent > 0) {
+          config.cutTokens = Math.max(0, measured - Math.floor((window * configured.targetPercent) / 100));
+        }
         if (pages) config.pages = pages;
         const compaction = await compactSession(
           input,

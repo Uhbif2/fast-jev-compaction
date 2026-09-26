@@ -16,6 +16,7 @@ Local marketplace в `~/.claude/settings.json` (`extraKnownMarketplaces`) и
 | option | value |
 |---|---:|
 | `compactAtPercent` | `30` |
+| `targetPercent` | default `15` (local.15): до какой доли окна выгружать, `0` — только порог |
 | `keepThreshold` | `0.5` |
 | `preserveRecentMessages` | `12` |
 | `minReductionRatio` | `0` |
@@ -128,7 +129,14 @@ Jev checked 55 of 55 candidate(s): 27 result(s) truncated, 4 call(s) dropped, 24
   вычтено то, что ушло из видимых сообщений; thinking уходит тоже, но плагину его размер не виден;
 - `messages ~X → ~Y` вместо этого — сессия была переоткрыта с задвоенной историей, и последний
   замер устарел; рядом стоит `N duplicated call(s) removed`;
-- `no Jev request needed` — сократились только thinking и дубли, кандидатов для Jev не было.
+- `no Jev request needed` — сократились только thinking, дубли и старые входы Write/Edit,
+  кандидатов для Jev не было;
+- `N more paged out to reach the size target` — выгружено сверх порога ради `targetPercent`;
+- `N page-in(s) since the last compaction` — сколько раз модель читала страницы после прошлой
+  компакции. Много — выгрузка слишком смелая: поднять `targetPercent`.
+
+Страницы лежат в `~/.claude/fast-jev-pages/<session>/`; это данные сессии, удалять их можно вместе
+с сессией. Блокировки встроенного саммари — `~/.claude/fast-jev-guard.log`.
 
 **Эффект проверять по следующему запросу, а не по boundary.** После компакции, которая
 состоялась, плагин на следующем `turn.complete` показывает «first request after compaction

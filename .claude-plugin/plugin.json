@@ -1,6 +1,6 @@
 {
   "name": "fast-jev-compaction-local",
-  "version": "0.3.0-local.14",
+  "version": "0.3.0-local.15",
   "description": "Local hardened fast-jev compaction: Jev-only (never a Claude summary), conservative tool relevance scoring, result previews, sharded dialogue context, bounded retries.",
   "license": "MIT",
   "userConfig": {
@@ -27,6 +27,12 @@
       "title": "Compaction percentage",
       "description": "Context percentage at which turn.complete requests compaction.",
       "default": 60
+    },
+    "targetPercent": {
+      "type": "number",
+      "title": "Target after compaction",
+      "description": "Context percentage a compaction aims for: results are paged out, least needed by Jev's order first, until it is reached (each stays one file read away). 0 uses the keep threshold alone.",
+      "default": 15
     },
     "minReductionRatio": {
       "type": "number",
