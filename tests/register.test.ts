@@ -34,6 +34,13 @@ function transcript(): SessionMessage[] {
   ];
 }
 
+function bashTranscript(): SessionMessage[] {
+  return transcript().map((m) => ({
+    ...m,
+    toolUses: m.toolUses.map((u) => ({ ...u, tool: 'Bash', input: { command: 'npm test' } })),
+  }));
+}
+
 function jevAnswer(noul: number) {
   return async (_url: string, init?: { body?: string }) => {
     const { questions } = JSON.parse(init?.body ?? '{}') as { questions: Record<string, unknown> };
@@ -43,6 +50,7 @@ function jevAnswer(noul: number) {
 }
 
 function engine(setup: {
+  failWrites?: boolean;
   sessionMessages?: SessionMessage[];
   fetch?: (url: string, init?: { body?: string }) => Promise<unknown>;
   context?: () => { tokens?: number; percent?: number; window: number };
@@ -53,18 +61,26 @@ function engine(setup: {
   const toasts: string[] = [];
   const order: string[] = [];
   const stored = new Map<string, unknown>();
+  const written = new Map<string, string>();
   const $ = {
     store: {
       get: async (key: string) => stored.get(key),
       set: async (key: string, value: unknown) => void stored.set(key, JSON.parse(JSON.stringify(value))),
     },
     ui: { log: () => {}, toast: (text: string) => void toasts.push(text) },
-    env: { get: async () => 'k' },
+    env: { get: async (name: string) => (name === 'USERPROFILE' ? 'C:\\Users\\me' : name === 'CLAUDE_CONFIG_DIR' ? undefined : 'k') },
+    fs: {
+      write: async (path: string, text: string) => {
+        if (setup.failWrites) throw new Error('EACCES');
+        written.set(path, text);
+      },
+    },
     settings: { read: async () => ({}) },
     clock: { sleep: async () => {} },
     http: { fetch: setup.fetch ?? jevAnswer(0.001) },
     session: {
       id: async () => 'session-1',
+      cwd: async () => 'C:\\work\\proj',
       messages: async () => setup.sessionMessages ?? [],
       usage: async () => ({ context: setup.context?.() ?? { window: 1_000_000 }, rateLimits: [] }),
       compact: async () => {
@@ -74,12 +90,12 @@ function engine(setup: {
     },
   };
   register(
-    ((name: string, fn: Handler) => {
-      handlers[name] = fn;
+    ((name: string, a: Handler | object, b?: Handler) => {
+      handlers[name] = (b ?? a) as Handler;
     }) as never,
     { preserveRecentMessages: 1, compactAtPercent: 30, ...setup.options } as never,
   );
-  return { handlers, toasts, order, $, stored };
+  return { handlers, toasts, order, $, stored, written };
 }
 
 describe('session.compact never hands over to the Claude summary', () => {
@@ -146,7 +162,7 @@ describe('session.compact never hands over to the Claude summary', () => {
     expect(result.messages.flatMap((m: SessionMessage) => m.toolUses.map((t) => t.tool_use_id))).toEqual(['t1']);
     expect(result.messages.filter((m: SessionMessage) => m.text === 'a.ts is fine.')).toHaveLength(1);
     expect(asked).toBe(0);
-    expect(toasts.at(-1)).toMatch(/no Jev request needed; 1 duplicated call\(s\) removed; 1 duplicated text\(s\) removed/);
+    expect(toasts.at(-1)).toMatch(/no Jev request needed; 0 page-in\(s\) since the last compaction; 1 duplicated call\(s\) removed; 1 duplicated text\(s\) removed/);
   });
 
   it('refuses while a call still waits for its result', async () => {
@@ -172,6 +188,31 @@ describe('session.compact never hands over to the Claude summary', () => {
     const texts = result.messages.map((m: SessionMessage) => m.text);
     expect(texts.some((t: string) => t.endsWith('while you were working:\nalso look at b.ts'))).toBe(true);
     expect(stored.get('queued-prompts')).toEqual({});
+  });
+
+  it('pages a shortened result out to a file its note names, and counts reading it back', async () => {
+    const { handlers, $, toasts, written } = engine({ fetch: jevAnswer(0.001) });
+    const messages = bashTranscript();
+    const result = await handlers['session.compact']!($, { trigger: 'manual', messages }, nextNeverCalled);
+    const page = 'C:/Users/me/.claude/fast-jev-pages/session-1/t1.txt';
+    expect(written.get(page)).toBe(messages[1]!.toolUses[0]!.text);
+    const texts = result.messages.flatMap((m: SessionMessage) => (m.toolResults ?? []).map((r) => r.text));
+    expect(texts.some((t: string) => t.includes(`the full text is in ${page}`))).toBe(true);
+
+    const allowed = await handlers['tool.check']!($, { tool: 'Read', input: { file_path: page.replaceAll('/', '\\') } }, async () => ({ decision: 'ask' }));
+    expect(allowed).toMatchObject({ decision: 'allow' });
+    const other = await handlers['tool.check']!($, { tool: 'Read', input: { file_path: 'C:/Users/me/.claude/fast-jev-pages/../settings.json' } }, async () => ({ decision: 'ask' }));
+    expect(other).toEqual({ decision: 'ask' });
+    await handlers['tool.call']!($, { tool: 'Read', file_path: page }, async () => ({ result: 'x' }));
+    await handlers['session.compact']!($, { trigger: 'manual', messages: bashTranscript() }, nextNeverCalled);
+    expect(toasts.some((t) => /1 page-in\(s\) since the last compaction/.test(t))).toBe(true);
+  });
+
+  it('names the transcript when a page cannot be written', async () => {
+    const { handlers, $ } = engine({ fetch: jevAnswer(0.001), failWrites: true });
+    const result = await handlers['session.compact']!($, { trigger: 'manual', messages: bashTranscript() }, nextNeverCalled);
+    const texts = result.messages.flatMap((m: SessionMessage) => (m.toolResults ?? []).map((r) => r.text));
+    expect(texts.some((t: string) => t.includes('the original is in C:/Users/me/.claude/projects/C--work-proj/session-1.jsonl'))).toBe(true);
   });
 
   it('never rejects, even when the UI throws', async () => {

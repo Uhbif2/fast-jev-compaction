@@ -11,6 +11,7 @@ import type {
 import { assistantTextCandidateIndices, compact, compactionCandidates, reductionRatio, resolveOptions } from '../src/compact.js';
 import { collectToolCalls, goalFromMessages } from '../src/state.js';
 import { buildJevRequest, DEFAULT_MODEL, parseJevResponse } from '../src/request.js';
+import { writerInputCandidates } from '../src/inputs.js';
 import {
   dedupeReplayedHistory,
   engineMessages,
@@ -305,9 +306,11 @@ export function summarize(result: CompactResult): string {
     stats.deferred > 0 ? `${stats.deferred} left for the next pass` : '',
     stats.assistantTextsDropped > 0 ? `${stats.assistantTextsDropped} assistant text(s) dropped` : '',
   ].filter(Boolean);
+  const inputs = stats.inputsPaged > 0 ? `; ${stats.inputsPaged} old Write/Edit input(s) paged out` : '';
+  if (stats.asked + stats.deferred === 0) return `no Jev request needed${inputs}`;
   return `Jev checked ${stats.asked} of ${stats.asked + stats.deferred} candidate(s)${
     parts.length > 0 ? ': ' + parts.join(', ') : ''
-  } in ${stats.requests} request(s)`;
+  } in ${stats.requests} request(s)${inputs}`;
 }
 
 /**
@@ -346,7 +349,7 @@ export function decisionLog(result: CompactResult): string {
     .filter((d) => d.reason !== 'pinned')
     .map(
       (d) =>
-        `${d.id}:${d.tool}:${d.action}/call=${d.keepCall.toFixed(2)}/result=${d.keepResult.toFixed(2)}`,
+        `${d.id}:${d.tool}:${d.action}/call=${d.keepCall.toFixed(2)}/result=${d.keepResult.toFixed(2)}${d.tool_use_id ? '@' + d.tool_use_id : ''}`,
     )
     .join(' ');
 }
@@ -460,6 +463,75 @@ function tokensText(tokens: number): string {
   return tokens >= 1_000 ? `${Math.round(tokens / 1_000)}k` : String(tokens);
 }
 
+/** The engine's config directory, as it resolves it. */
+async function configDir($: { env: { get: (name: string) => Promise<string | undefined> } }): Promise<string> {
+  const dir = (await $.env.get('CLAUDE_CONFIG_DIR')) ||
+    `${(await $.env.get('USERPROFILE')) || (await $.env.get('HOME')) || '~'}/.claude`;
+  return dir.replace(/\\/g, '/').replace(/\/+$/, '');
+}
+
+/** <config>/fast-jev-pages, or '' when the config directory cannot be told. */
+async function pagesRootOf($: { env: { get: (name: string) => Promise<string | undefined> } }): Promise<string> {
+  try {
+    return `${await configDir($)}/${PAGES_DIR}`;
+  } catch {
+    return '';
+  }
+}
+
+/** <config>/projects/<cwd, every character but a-z A-Z 0-9 as '-'>/<id>.jsonl, as Claude Code 2.1.280 names it. */
+export function transcriptPathFor(config: string, cwd: string, sessionId: string): string {
+  return `${config}/projects/${cwd.replace(/[^a-zA-Z0-9]/g, '-')}/${sessionId}.jsonl`;
+}
+
+/** Page files: the full text of each shortened result, one file per tool_use_id. */
+export const PAGES_DIR = 'fast-jev-pages';
+/** $.fs rejects over 4 MiB; UTF-8 takes up to 3 bytes a character. */
+const PAGE_MAX_CHARS = 1_300_000;
+
+export function isPagePath(path: unknown, pagesRoot: string): boolean {
+  if (typeof path !== 'string' || !pagesRoot) return false;
+  const norm = path.replace(/\\/g, '/').toLowerCase();
+  const root = pagesRoot.replace(/\\/g, '/').toLowerCase() + '/';
+  return norm.startsWith(root) && !norm.slice(root.length).split('/').includes('..');
+}
+
+/** Result text of every answered call in the engine's messages. */
+function resultTextsOf(messages: readonly Message[]): Map<string, string> {
+  const texts = new Map<string, string>();
+  for (const message of messages) for (const tool of message.toolUses) if (tool.text !== undefined) texts.set(tool.tool_use_id, tool.text);
+  for (const message of messages) for (const result of message.toolResults ?? []) texts.set(result.tool_use_id, result.text);
+  return texts;
+}
+
+type PageTarget = {
+  fs: { write: (path: string, text: string) => Promise<void> };
+};
+
+/**
+ * Writes the page of every candidate before Jev decides, so that a note can
+ * name a page only when it exists. A candidate Jev keeps costs one small file.
+ */
+export async function writePages(
+  $: PageTarget,
+  dir: string,
+  texts: ReadonlyMap<string, string>,
+  ids: readonly string[],
+): Promise<Set<string>> {
+  const written = new Set<string>();
+  for (const id of ids) {
+    const text = texts.get(id);
+    if (text === undefined || text.length > PAGE_MAX_CHARS || !/^[A-Za-z0-9_-]+$/.test(id)) continue;
+    try {
+      await $.fs.write(`${dir}/${id}.txt`, text);
+      written.add(id);
+    } catch {
+      // The note then names the transcript instead.
+    }
+  }
+  return written;
+}
+
 /** Origins of a message a person wrote: typed, from the phone bridge, the Desktop (SDK host), Slack. */
 const HUMAN_ORIGINS = new Set<PromptOrigin['kind']>(['composer', 'bridge', 'sdk', 'slack-ping', 'channel']);
 const QUEUED_KEY = 'queued-prompts';
@@ -527,6 +599,10 @@ export const register: Register = (on: On, options: PluginOptions) => {
   // Only affects ordering, never a deletion decision. Later passes advance
   // through the remaining candidates instead of rescoring the same large keeps.
   const reviewedToolUseIds = new Set<string>();
+  /** <config>/fast-jev-pages, once known; Read under it is a page-in. */
+  let pagesRoot = '';
+  /** Page-ins since the last compaction: how often the model needed what was paged out. */
+  let pageIns = 0;
 
   // Never `next(event)`: that is the engine's own Claude summary. Whatever goes
   // wrong, the hook answers itself: the compacted messages or `{ skip }`.
@@ -568,13 +644,37 @@ export const register: Register = (on: On, options: PluginOptions) => {
       const assistantEligible = resolvedPreflight.compactAssistantText
         ? assistantTextCandidateIndices(input, resolvedPreflight.preserveRecentMessages).length
         : 0;
-      const structural = repairs.length > 0 || thinkingRows > 0;
+      const writers = sessionId
+        ? writerInputCandidates(input, resolvedPreflight.preserveRecentMessages, resolvedPreflight.truncateHeadChars)
+        : [];
+      const structural = repairs.length > 0 || thinkingRows > 0 || writers.length > 0;
       if (eligible === 0 && assistantEligible === 0 && !structural) {
         return await skipWith(
           $,
           gate,
-          `${tag}: nothing eligible (${pinned} pinned of ${preflightCalls.length} tool call(s), no thinking or duplicates to drop); session unchanged, no Jev request`,
+          `${tag}: nothing eligible (${pinned} pinned of ${preflightCalls.length} tool call(s), no thinking, old Write/Edit input or duplicates to drop); session unchanged, no Jev request`,
         );
+      }
+
+      // Pages first: a note may name a page only once it exists.
+      let pages: HookConfig['pages'];
+      if (sessionId) {
+        try {
+          const root = await configDir($);
+          pagesRoot = `${root}/${PAGES_DIR}`;
+          const dir = `${pagesRoot}/${sessionId}`;
+          const candidates = compactionCandidates(preflightCalls, resolvedPreflight).map((call) => call.tool_use_id);
+          const written = await writePages($, dir, resultTextsOf(input), candidates);
+          const inputTexts = new Map(writers.map((w) => [`${w.tool_use_id}.input`, w.page]));
+          const inputsWritten = await writePages($, dir, inputTexts, [...inputTexts.keys()]);
+          pages = {
+            page: (id) => (written.has(id) ? `${dir}/${id}.txt` : undefined),
+            inputPage: (id) => (inputsWritten.has(`${id}.input`) ? `${dir}/${id}.input.txt` : undefined),
+            transcript: transcriptPathFor(root, await $.session.cwd(), sessionId),
+          };
+        } catch (error) {
+          logNotice($, `${tag}: pages not written (${errorText(error)}); notes name the transcript`);
+        }
       }
 
       let tokensBefore: number | undefined;
@@ -603,6 +703,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
         };
         const goal = compactionGoal(input, configured, event.instructions);
         if (goal) config.goal = goal;
+        if (pages) config.pages = pages;
         const compaction = await compactSession(
           input,
           config,
@@ -628,23 +729,27 @@ export const register: Register = (on: On, options: PluginOptions) => {
         for (const id of result.reviewedToolUseIds) reviewedToolUseIds.add(id);
         if (result.stats.deferred === 0) reviewedToolUseIds.clear();
         for (const line of decisionLogLines(result)) $.ui.log(line);
-        const jevCut = result.stats.requests > 0 && reductionRatio(result) > 0;
-        if (!jevCut && !structural) {
+        const cut = reductionRatio(result) > 0;
+        if (!cut && !structural) {
           return await skipWith($, gate, `${tag}: Jev kept everything; session unchanged (${summarize(result)})`);
         }
-        if (jevCut && reductionRatio(result) < config.minReductionRatio && !structural) {
+        if (cut && reductionRatio(result) < config.minReductionRatio && !structural) {
           return await skipWith($, gate,
             `${tag}: reduction below the ${percent(config.minReductionRatio)} minimum; session unchanged (${summarize(result)})`,
           );
         }
       } else {
-        rebuilt = toSessionMessages(input);
+        // Nothing for Jev: only the deterministic part (old writer inputs) runs.
+        const noJev: JevAsker = { ask: async () => { throw new Error('no Jev question expected'); } };
+        result = await compact(input, noJev, { ...configured, ...(pages ? { pages } : {}) });
+        rebuilt = toSessionMessages(result.messages);
       }
 
       const visibleBefore = visibleTokens(event.messages);
       const visibleAfter = visibleTokens(rebuilt.messages as Message[]);
       const parts = [
         result ? summarize(result) : 'no Jev request needed',
+        main ? `${pageIns} page-in(s) since the last compaction` : '',
         ...repairs,
         rebuilt.orphanCalls > 0 ? `${rebuilt.orphanCalls} call(s) without a result dropped` : '',
       ].filter(Boolean);
@@ -658,6 +763,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
       if (sessionId && (restoring.restored.length > 0 || restoring.present.length > 0)) {
         await forgetQueued($, sessionId, [...restoring.restored, ...restoring.present]);
       }
+      if (main && event.trigger !== 'precompute') pageIns = 0;
       if (tokensBefore !== undefined && event.trigger !== 'precompute') {
         effectPending = deduped.toolCalls + deduped.texts > 0 ? {} : { before: tokensBefore };
         // Manual compaction also starts the auto-compaction cooldown.
@@ -670,6 +776,25 @@ export const register: Register = (on: On, options: PluginOptions) => {
       }
       return await skipWith($, gate, `${tag}: Jev compaction failed, session unchanged, no Claude summary (${errorText(error)})`);
     }
+  });
+
+  // Reading a page back is part of compaction working: never a permission
+  // prompt, and counted, since how often it happens says whether compaction
+  // pages out too much.
+  on('tool.check', { tool: 'Read' }, async ($, event, next) => {
+    pagesRoot ||= await pagesRootOf($);
+    const path = (event.input as { file_path?: unknown } | undefined)?.file_path;
+    if (isPagePath(path, pagesRoot)) return { decision: 'allow', reason: 'fast-jev page of a shortened tool result' };
+    return next(event);
+  });
+  on('tool.call', { tool: 'Read' }, async ($, event, next) => {
+    pagesRoot ||= await pagesRootOf($);
+    const path = (event as { file_path?: unknown }).file_path;
+    if (event.agentId === undefined && isPagePath(path, pagesRoot)) {
+      pageIns += 1;
+      logNotice($, `fast-jev ${LOCAL_BUILD}: page-in ${pageIns} since the last compaction`);
+    }
+    return next(event);
   });
 
   // A message the user sends mid-turn reaches the model as an attachment of
