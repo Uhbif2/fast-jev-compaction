@@ -1,4 +1,5 @@
 import { noulAnswer } from './request.js';
+import { pageWriterInputs } from './inputs.js';
 import {
   collectToolCalls,
   COMPACTION_NOTE_MARKER,
@@ -35,6 +36,7 @@ export const DEFAULT_OPTIONS: ResolvedCompactOptions = {
   truncateHeadChars: 300,
   resultPreviewChars: 1_000,
   compactAssistantText: false,
+  pages: {},
 };
 
 /** TypeSafe Jev 1.13 physical limits. */
@@ -78,6 +80,7 @@ export function resolveOptions(options: CompactOptions = {}): ResolvedCompactOpt
       typeof options.compactAssistantText === 'boolean'
         ? options.compactAssistantText
         : DEFAULT_OPTIONS.compactAssistantText,
+    pages: options.pages ?? DEFAULT_OPTIONS.pages,
   };
 }
 
@@ -313,11 +316,11 @@ export function batchCalls(
 }
 
 export function decideCall(
-  call: Pick<ToolCall, 'id' | 'tool' | 'pinned'> & Partial<Pick<ToolCall, 'sideEffects'>>,
+  call: Pick<ToolCall, 'id' | 'tool' | 'pinned'> & Partial<Pick<ToolCall, 'sideEffects' | 'tool_use_id'>>,
   answer: CallAnswer,
   options: Pick<ResolvedCompactOptions, 'keepThreshold'>,
 ): CallDecision {
-  const base = { id: call.id, tool: call.tool, ...answer };
+  const base = { id: call.id, ...(call.tool_use_id ? { tool_use_id: call.tool_use_id } : {}), tool: call.tool, ...answer };
   if (call.pinned) return { ...base, action: 'keep', reason: 'pinned' };
   if (answer.keepResult >= options.keepThreshold) {
     return { ...base, action: 'keep', reason: 'kept' };
@@ -445,26 +448,31 @@ function planBatches(
 
 /**
  * A shortened result: head and tail of the output around a note. The note
- * points to the original (the session transcript keeps it) instead of
- * suggesting a re-run, which for a side-effecting call would repeat its effect.
+ * says where the whole text can be read back, a page file first, so that
+ * shortening is paging out, not losing; it never suggests a re-run, which for
+ * a side-effecting call would repeat its effect.
  */
 export function truncatedResultText(
   text: string,
   isError: boolean,
   keepChars: number,
   call: Pick<ToolCall, 'tool' | 'tool_use_id' | 'sideEffects'>,
+  pages: ResolvedCompactOptions['pages'] = {},
 ): string {
   const head = Math.max(0, keepChars);
   const tail = Math.max(0, keepChars);
   if (text.length <= head + tail + 200) return text;
   const cut = text.length - head - tail;
+  const page = pages.page?.(call.tool_use_id);
+  const where = page
+    ? `the full text is in ${page} (Read it, with offset/limit if long, whenever the missing part matters)`
+    : `the original is in ${pages.transcript || "this session's transcript (.jsonl)"}`;
   const advice = call.sideEffects
     ? 'do not re-run the call just to see its output: that may repeat its side effect'
-    : 'look it up again if the details are needed';
+    : page ? 'or look it up again' : 'look it up again if the details are needed';
   const note =
     `${COMPACTION_NOTE_MARKER}truncated ${cut} of ${text.length} chars of this ${call.tool} result` +
-    `${isError ? ' (error)' : ''}; the original is in this session's transcript (.jsonl), ` +
-    `tool_use_id=${call.tool_use_id}; ${advice}]`;
+    `${isError ? ' (error)' : ''}; ${where}, tool_use_id=${call.tool_use_id}; ${advice}]`;
   const shortened = [head > 0 ? text.slice(0, head) : '', note, tail > 0 ? text.slice(-tail) : '']
     .filter(Boolean)
     .join('\n');
@@ -505,6 +513,7 @@ export function applyDecisions(
   calls: readonly ToolCall[],
   headChars: number,
   dropAssistantTextIndices: ReadonlySet<number> = new Set<number>(),
+  pages: ResolvedCompactOptions['pages'] = {},
 ): Message[] {
   const byId = new Map(calls.map((call) => [call.id, call]));
   const byUseId = new Map(calls.map((call) => [call.tool_use_id, call]));
@@ -514,6 +523,7 @@ export function applyDecisions(
       isError,
       headChars,
       byUseId.get(useId) ?? { tool, tool_use_id: useId, sideEffects: hasSideEffects(tool) },
+      pages,
     );
   const actions = new Map<string, CallDecision['action']>();
   for (const decision of decisions) {
@@ -817,12 +827,16 @@ export async function compact(
       .filter((decision) => decision.action === 'drop_text')
       .map((decision) => decision.index),
   );
+  const writers = resolved.pages.inputPage
+    ? pageWriterInputs(messages, resolved.preserveRecentMessages, resolved.truncateHeadChars, resolved.pages.inputPage)
+    : { messages: [...messages], paged: 0, charsSaved: 0 };
   const kept = applyDecisions(
-    messages,
+    writers.messages,
     decisions,
     calls,
     resolved.truncateHeadChars,
     dropAssistantTextIndices,
+    resolved.pages,
   );
   return {
     reviewedToolUseIds: toolCandidates.filter((call) => answers.has(call.id)).map((call) => call.tool_use_id),
@@ -830,6 +844,8 @@ export async function compact(
     decisions,
     assistantTextDecisions,
     stats: {
+      inputsPaged: writers.paged,
+      inputCharsSaved: writers.charsSaved,
       messagesBefore: messages.length,
       messagesAfter: kept.length,
       charsBefore,

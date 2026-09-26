@@ -128,19 +128,19 @@ describe('compactSession', () => {
     expect(messages.map((m) => m.handle)).toEqual(['h-0', undefined, undefined, undefined, 'h-6']);
     expect(messages[3]).toEqual({ role: 'assistant', text: 'Fixing now.', toolUses: [] });
     expect(summarize(output)).toBe('Jev checked 1 of 1 candidate(s): 1 call(s) dropped, 0 kept in 1 request(s)');
-    expect(decisionLog(output)).toBe('t1:Read:drop_call/call=0.10/result=0.10 t2:Bash:keep/call=1.00/result=1.00');
+    expect(decisionLog(output)).toBe('t1:Read:drop_call/call=0.10/result=0.10@tool-1 t2:Bash:keep/call=1.00/result=1.00@tool-2');
     expect(decisionLogLines(output)).toEqual([`decisions: ${decisionLog(output)}`]);
   });
 
   it('splits a long decision log into ui.log lines under the host limit', async () => {
     const config = { ...resolveHookConfig({ preserveRecentMessages: 1, compactAssistantText: false }), apiKey: 'k' };
     const { result: output } = await compactSession(transcript(), config, jevFetch(() => 0.1));
-    const lines = decisionLogLines(output, 60);
+    const lines = decisionLogLines(output, 70);
     expect(lines).toEqual([
-      'decisions (1/2): t1:Read:drop_call/call=0.10/result=0.10',
-      'decisions (2/2): t2:Bash:keep/call=1.00/result=1.00',
+      'decisions (1/2): t1:Read:drop_call/call=0.10/result=0.10@tool-1',
+      'decisions (2/2): t2:Bash:keep/call=1.00/result=1.00@tool-2',
     ]);
-    expect(lines.every((line) => line.length <= 60)).toBe(true);
+    expect(lines.every((line) => line.length <= 70)).toBe(true);
     expect(decisionLogLines({ ...output, decisions: [] })).toEqual(['decisions: (none)']);
   });
 

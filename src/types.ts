@@ -72,6 +72,8 @@ export type CallAction = 'keep' | 'drop_result' | 'drop_call';
 
 export interface CallDecision extends CallAnswer {
   id: string;
+  /** The engine's id of the call, for matching a decision to the transcript. */
+  tool_use_id?: string;
   tool: string;
   action: CallAction;
   reason: 'pinned' | 'kept' | 'result_dropped' | 'call_dropped';
@@ -146,6 +148,17 @@ export interface CompactOptions {
   resultPreviewChars?: number;
   /** Also score old assistant text for relevance; user text is never removed. Default false. */
   compactAssistantText?: boolean;
+  /**
+   * Where the full text of a shortened result can be read back, named in its
+   * note: `page(tool_use_id)` is a file the host writes, `transcript` the
+   * session's .jsonl. Absent, the note names neither path.
+   */
+  pages?: {
+    page?: (toolUseId: string) => string | undefined;
+    /** The page holding the whole input of an old file-writer call; its long fields are paged out when present. */
+    inputPage?: (toolUseId: string) => string | undefined;
+    transcript?: string;
+  };
 }
 
 export interface ResolvedCompactOptions {
@@ -159,6 +172,7 @@ export interface ResolvedCompactOptions {
   truncateHeadChars: number;
   resultPreviewChars: number;
   compactAssistantText: boolean;
+  pages: NonNullable<CompactOptions['pages']>;
 }
 
 export interface CompactResult {
@@ -169,6 +183,9 @@ export interface CompactResult {
   decisions: CallDecision[];
   assistantTextDecisions: AssistantTextDecision[];
   stats: {
+    /** Old file-writer inputs paged out, and the characters that took out. */
+    inputsPaged: number;
+    inputCharsSaved: number;
     messagesBefore: number;
     messagesAfter: number;
     charsBefore: number;
