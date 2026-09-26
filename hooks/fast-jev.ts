@@ -1,17 +1,27 @@
 import type {
   On,
   PluginOptions,
+  PromptOrigin,
   Register,
   SessionCompactResult,
   SessionMessage,
-  ToolResultSummary,
-  ToolUseSummary,
   TurnCompleteInput,
 } from 'claude-code';
 
 import { assistantTextCandidateIndices, compact, compactionCandidates, reductionRatio, resolveOptions } from '../src/compact.js';
 import { collectToolCalls, goalFromMessages } from '../src/state.js';
 import { buildJevRequest, DEFAULT_MODEL, parseJevResponse } from '../src/request.js';
+import {
+  dedupeReplayedHistory,
+  engineMessages,
+  restoreQueuedPrompts,
+  thinkingOnlyRows,
+  TurnInProgressError,
+  visibleTokens,
+  type EngineMessage,
+  type EngineRebuild,
+  type QueuedPrompt,
+} from '../src/transcript.js';
 declare const setTimeout: (handler: () => void, timeoutMs: number) => unknown;
 declare const clearTimeout: (timer: unknown) => void;
 
@@ -21,8 +31,6 @@ import type {
   CompactResult,
   JevAsker,
   Message,
-  ToolResult,
-  ToolUse,
 } from '../src/types.js';
 
 const HOOK_DEFAULTS = {
@@ -60,7 +68,7 @@ const timerDeadline: DeadlineWait = (ms) => {
   return { expired, cancel: () => clearTimeout(timer) };
 };
 
-export const LOCAL_BUILD = '0.3.0-local.13';
+export const LOCAL_BUILD = '0.3.0-local.14';
 
 export const JEV_MAX_ATTEMPTS = 6;
 const JEV_RETRY_DELAYS_MS = [1_000, 2_000, 4_000, 8_000, 15_000];
@@ -237,68 +245,26 @@ export function jevAsker(
   };
 }
 
-function toolUseSummary(tool: ToolUse): ToolUseSummary {
-  const summary: ToolUseSummary = {
-    tool_use_id: tool.tool_use_id,
-    tool: tool.tool,
-    input: tool.input,
-  };
-  if (tool.text !== undefined) summary.text = tool.text;
-  if (tool.isError) summary.isError = true;
-  return summary;
-}
-
-function toolResultSummary(result: ToolResult): ToolResultSummary {
-  return {
-    tool_use_id: result.tool_use_id,
-    text: result.text,
-    isError: result.isError ?? false,
-  };
-}
-
 /**
- * Maps the library's output back onto session messages. Whatever came back
- * unchanged (a message, a tool use, a tool result) is the engine's own object,
- * handle included; anything rebuilt is a fresh message without a handle, so the
- * engine takes the edited content instead of its original.
+ * Maps the library's output onto what the engine writes. Only user text keeps
+ * the engine's own object (and handle); every assistant and tool_result
+ * message is rebuilt, because the engine writes kept ones with links into the
+ * uncompacted history (see src/transcript.ts).
  */
-export function toSessionMessages(
-  input: readonly SessionMessage[],
-  output: readonly Message[],
-): SessionMessage[] {
-  const messages = new Map<Message, SessionMessage>();
-  const uses = new Map<ToolUse, ToolUseSummary>();
-  const results = new Map<ToolResult, ToolResultSummary>();
-  for (const message of input) {
-    messages.set(message, message);
-    for (const tool of message.toolUses) uses.set(tool, tool);
-    for (const result of message.toolResults ?? []) results.set(result, result);
-  }
-  return output.map((message) => {
-    const own = messages.get(message);
-    if (own) return own;
-    const rebuilt: SessionMessage = {
-      role: message.role,
-      text: message.text,
-      toolUses: message.toolUses.map((tool) => uses.get(tool) ?? toolUseSummary(tool)),
-    };
-    if (message.toolResults && message.toolResults.length > 0) {
-      rebuilt.toolResults = message.toolResults.map(
-        (result) => results.get(result) ?? toolResultSummary(result),
-      );
-    }
-    return rebuilt;
-  });
+export function toSessionMessages(output: readonly Message[]): EngineRebuild & { messages: SessionMessage[] } {
+  const rebuild = engineMessages(output as readonly EngineMessage[]);
+  return { ...rebuild, messages: rebuild.messages as SessionMessage[] };
 }
 
 export type SessionCompaction = {
   result: CompactResult;
   messages: SessionMessage[];
+  rebuild: ReturnType<typeof toSessionMessages>;
 };
 
 /** Runs the library over a session transcript; throws when the key is missing or Jev fails. */
 export async function compactSession(
-  messages: readonly SessionMessage[],
+  messages: readonly (SessionMessage | Message)[],
   config: HookConfig,
   fetchFn: HookFetch,
   log: (text: string) => void = () => {},
@@ -309,13 +275,14 @@ export async function compactSession(
 ): Promise<SessionCompaction> {
   if (!config.apiKey) throw new Error('TYPESAFE_API_KEY is not configured');
   const asker = jevAsker(fetchFn, config.apiKey, config.model, log, transport, sleep, JEV_TOTAL_BUDGET_MS, deadlineWait);
-  const result = await compact(messages, asker, config, observer);
-  return { result, messages: toSessionMessages(messages, result.messages) };
+  const result = await compact(messages as readonly Message[], asker, config, observer);
+  const rebuild = toSessionMessages(result.messages);
+  return { result, messages: rebuild.messages, rebuild };
 }
 
 /** `/compact <text>` steers Jev on top of the default goal (the latest user prompts). */
 export function compactionGoal(
-  messages: readonly SessionMessage[],
+  messages: readonly Message[],
   config: Pick<HookConfig, 'goal'>,
   instructions?: string,
 ): string | undefined {
@@ -328,20 +295,48 @@ function percent(ratio: number): string {
   return `${Math.round(ratio * 100)}%`;
 }
 
+/** What Jev decided, in counts; sizes are reported separately, in tokens. */
 export function summarize(result: CompactResult): string {
   const { stats } = result;
   const parts = [
-    stats.deferred > 0 ? `${stats.asked} checked, ${stats.deferred} deferred` : '',
-    stats.kept > 0 ? `${stats.kept} kept` : '',
-    stats.resultsDropped > 0 ? `${stats.resultsDropped} results truncated` : '',
-    stats.callsDropped > 0 ? `${stats.callsDropped} call_dropped` : '',
-    stats.pinned > 0 ? `${stats.pinned} pinned` : '',
+    stats.resultsDropped > 0 ? `${stats.resultsDropped} result(s) truncated` : '',
+    stats.callsDropped > 0 ? `${stats.callsDropped} call(s) dropped` : '',
+    stats.asked > 0 ? `${stats.asked - stats.resultsDropped - stats.callsDropped} kept` : '',
+    stats.deferred > 0 ? `${stats.deferred} left for the next pass` : '',
     stats.assistantTextsDropped > 0 ? `${stats.assistantTextsDropped} assistant text(s) dropped` : '',
-    stats.assistantTextsKept > 0 ? `${stats.assistantTextsKept} assistant text(s) kept` : '',
   ].filter(Boolean);
-  return `${percent(reductionRatio(result))} reduction; ${
-    parts.join(', ') || 'no tool calls'
-  }; state ~${stats.stateTokens} tokens (${stats.stateStage}) in ${stats.requests} request(s)`;
+  return `Jev checked ${stats.asked} of ${stats.asked + stats.deferred} candidate(s)${
+    parts.length > 0 ? ': ' + parts.join(', ') : ''
+  } in ${stats.requests} request(s)`;
+}
+
+/**
+ * The size report. `before` is the real context of the last request; the cut
+ * is what left the visible messages. Thinking blocks of old steps leave too
+ * but their size is not visible to a plugin, so the result is an upper bound
+ * and the next request gives the exact figure. The engine's own "compacted
+ * to" number counts message content only and is not comparable with either.
+ */
+export function sizeReport(
+  before: number | undefined,
+  visibleBefore: number,
+  visibleAfter: number,
+  thinkingRows: number,
+  reloaded = false,
+): string {
+  const cut = Math.max(0, visibleBefore - visibleAfter);
+  const thinking = thinkingRows > 0 ? ` and ${thinkingRows} thinking block(s) of unknown size` : '';
+  if (before === undefined) return `−${tokensText(cut)} tokens of messages${thinking}`;
+  // The last request was measured before a reload doubled the history: that
+  // figure says nothing about the context now, the messages themselves do.
+  if (reloaded || visibleBefore > before) {
+    return `messages ~${tokensText(visibleBefore)} → ~${tokensText(visibleAfter)} tokens` +
+      (thinkingRows > 0 ? `, plus ${thinkingRows} thinking block(s) of unknown size dropped ` : ' ') +
+      `(the last measured context, ${tokensText(before)}, predates the reload that doubled the history; the next request shows the exact size)`;
+  }
+  const after = Math.max(0, before - cut);
+  return `context ${tokensText(before)} → ${thinkingRows > 0 ? 'under ' : '~'}${tokensText(after)} tokens ` +
+    `(−${tokensText(cut)} of messages${thinking}; the next request shows the exact size)`;
 }
 
 const UI_LOG_MAX_CHARS = 4096;
@@ -465,14 +460,69 @@ function tokensText(tokens: number): string {
   return tokens >= 1_000 ? `${Math.round(tokens / 1_000)}k` : String(tokens);
 }
 
+/** Origins of a message a person wrote: typed, from the phone bridge, the Desktop (SDK host), Slack. */
+const HUMAN_ORIGINS = new Set<PromptOrigin['kind']>(['composer', 'bridge', 'sdk', 'slack-ping', 'channel']);
+const QUEUED_KEY = 'queued-prompts';
+const QUEUED_PER_SESSION = 50;
+const QUEUED_SESSIONS = 30;
+
+type QueuedStore = Record<string, QueuedPrompt[]>;
+type StoreTarget = { store: { get: (key: string) => Promise<unknown>; set: (key: string, value: unknown) => Promise<void> } };
+
+function validQueued(entry: unknown): entry is QueuedPrompt {
+  const e = entry as QueuedPrompt | undefined;
+  return typeof e?.text === 'string' && typeof e.at === 'number' && (e.after === undefined || typeof e.after === 'string');
+}
+
+async function queuedStore($: StoreTarget): Promise<QueuedStore> {
+  const value = await $.store.get(QUEUED_KEY);
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const store: QueuedStore = {};
+  for (const [id, list] of Object.entries(value)) if (Array.isArray(list)) store[id] = list.filter(validQueued);
+  return store;
+}
+
+/** Mid-turn user messages recorded for a session; empty when the store is unreadable. */
+export async function readQueued($: StoreTarget, sessionId: string): Promise<QueuedPrompt[]> {
+  try {
+    return (await queuedStore($))[sessionId] ?? [];
+  } catch {
+    return [];
+  }
+}
+
+export async function rememberQueued($: StoreTarget, sessionId: string, entry: QueuedPrompt): Promise<void> {
+  const store = await queuedStore($);
+  store[sessionId] = [...(store[sessionId] ?? []), entry].slice(-QUEUED_PER_SESSION);
+  const newest = (list: QueuedPrompt[]) => Math.max(0, ...list.map((e) => e.at));
+  const kept = Object.entries(store).sort((a, b) => newest(b[1]) - newest(a[1])).slice(0, QUEUED_SESSIONS);
+  await $.store.set(QUEUED_KEY, Object.fromEntries(kept));
+}
+
+/** Drops entries now written into the transcript as user text. */
+export async function forgetQueued($: StoreTarget, sessionId: string, done: readonly QueuedPrompt[]): Promise<void> {
+  try {
+    const store = await queuedStore($);
+    const left = (store[sessionId] ?? []).filter((e) => !done.some((d) => d.at === e.at && d.text === e.text));
+    if (left.length > 0) store[sessionId] = left;
+    else delete store[sessionId];
+    await $.store.set(QUEUED_KEY, store);
+  } catch {
+    // Kept entries are found as present text next time and dropped then.
+  }
+}
+
 export const register: Register = (on: On, options: PluginOptions) => {
   const configured = resolveHookConfig(options);
   const gate = toastGate();
   let compacting = false;
   /** Context size when auto-compaction last ran; the next run waits for real growth. */
   let lastAutoTokens: number | undefined;
-  /** Context size before the last compaction that stood, to report its real effect. */
-  let effectPending: number | undefined;
+  /**
+   * Set when a compaction stood, to report its real effect at the next turn;
+   * `before` is left out when the last measurement predates a reload.
+   */
+  let effectPending: { before?: number } | undefined;
   let lastAutoError = '';
   // Only affects ordering, never a deletion decision. Later passes advance
   // through the remaining candidates instead of rescoring the same large keeps.
@@ -483,100 +533,159 @@ export const register: Register = (on: On, options: PluginOptions) => {
   on('session.compact', async ($, event, _next): Promise<SessionCompactResult> => {
     const tag = `fast-jev ${LOCAL_BUILD} [${event.trigger}${event.agentId ? ', subagent' : ''}]`;
     const transport = emptyTransportStats();
+    const main = event.agentId === undefined;
     try {
+      // Repair first, then judge: a transcript the engine reloaded after an
+      // earlier compaction may hold every old turn twice, and mid-turn user
+      // messages live in attachments the rebuild does not carry.
+      const deduped = dedupeReplayedHistory(event.messages as readonly EngineMessage[]);
+      let sessionId: string | undefined;
+      try {
+        if (main) sessionId = await $.session.id();
+      } catch {
+        // Without an id, mid-turn messages are not restored this time.
+      }
+      const queued = sessionId ? await readQueued($, sessionId) : [];
+      const restoring = restoreQueuedPrompts(deduped.messages, queued);
+      const input = restoring.messages;
+      const repairs = [
+        deduped.toolCalls > 0 ? `${deduped.toolCalls} duplicated call(s) removed` : '',
+        deduped.texts > 0 ? `${deduped.texts} duplicated text(s) removed` : '',
+        restoring.restored.length > 0 ? `${restoring.restored.length} mid-turn user message(s) kept as text` : '',
+      ].filter(Boolean);
+      const thinkingRows = thinkingOnlyRows(input);
+      // Refuses now, before any Jev request, when a call still waits for its result.
+      toSessionMessages(input);
+
       const resolvedPreflight = resolveOptions(configured);
       const preflightCalls = collectToolCalls(
-        event.messages,
+        input,
         resolvedPreflight.preserveRecentMessages,
         resolvedPreflight.resultPreviewChars,
       );
       const eligible = compactionCandidates(preflightCalls, resolvedPreflight).length;
       const pinned = preflightCalls.filter((call) => call.pinned).length;
-      const rawToolUses = event.messages.reduce((sum, message) => sum + message.toolUses.length, 0);
-      const explicitToolResults = event.messages.reduce((sum, message) => sum + (message.toolResults?.length ?? 0), 0);
-      const inlineOutcomes = event.messages.reduce(
-        (sum, message) => sum + message.toolUses.filter((tool) => tool.text !== undefined).length,
-        0,
-      );
       const assistantEligible = resolvedPreflight.compactAssistantText
-        ? assistantTextCandidateIndices(event.messages, resolvedPreflight.preserveRecentMessages).length
+        ? assistantTextCandidateIndices(input, resolvedPreflight.preserveRecentMessages).length
         : 0;
-      if (eligible === 0 && assistantEligible === 0) {
+      const structural = repairs.length > 0 || thinkingRows > 0;
+      if (eligible === 0 && assistantEligible === 0 && !structural) {
         return await skipWith(
           $,
           gate,
-          `${tag}: nothing eligible (${pinned} pinned of ${preflightCalls.length} paired; raw ${rawToolUses} tool_use, ${explicitToolResults} tool_result, ${inlineOutcomes} inline outcome(s)); session unchanged, no Jev request`,
+          `${tag}: nothing eligible (${pinned} pinned of ${preflightCalls.length} tool call(s), no thinking or duplicates to drop); session unchanged, no Jev request`,
         );
       }
 
-      await sayNotice(
-        $,
-        gate,
-        `${tag}: Jev compaction of ${eligible} tool pair(s)` +
-          (assistantEligible > 0 ? ` and ${assistantEligible} assistant text(s)` : '') +
-          `, ${pinned} pinned; Claude summary off`,
-      );
       let tokensBefore: number | undefined;
-      if (event.agentId === undefined) {
+      if (main) {
         try {
           tokensBefore = (await $.session.usage()).context.tokens;
         } catch {
-          // Only the effect report needs it.
+          // Only the size report needs it.
         }
       }
-      const config: HookConfig = {
-        ...configured,
-        recentlyReviewedToolUseIds: [...reviewedToolUseIds],
-        apiKey: await getApiKey($, configured),
-      };
-      const goal = compactionGoal(event.messages, configured, event.instructions);
-      if (goal) config.goal = goal;
       const started = Date.now();
-      const { result, messages } = await compactSession(
-        event.messages,
-        config,
-        async (url, init) => {
-          const response = await $.http.fetch(url, init);
-          return { status: response.status, ok: response.ok, text: response.text, headers: response.headers };
-        },
-        (line) => $.ui.log(line),
-        transport,
-        (ms) => $.clock.sleep(ms),
-        {
-          request: (index, planned) =>
-            progressNotice($, gate, `${tag}: Jev request ${index}/${planned}, ${Math.round((Date.now() - started) / 1000)} s`),
-        },
-        (ms) => {
-          const controller = new AbortController();
-          const expired = $.clock.sleep(ms, { signal: controller.signal });
-          return { expired, cancel: () => controller.abort() };
-        },
-      );
-      for (const id of result.reviewedToolUseIds) reviewedToolUseIds.add(id);
-      if (result.stats.deferred === 0) reviewedToolUseIds.clear();
-      for (const line of decisionLogLines(result)) $.ui.log(line);
-      if (result.stats.requests === 0 || reductionRatio(result) <= 0) {
-        return await skipWith($, gate, `${tag}: Jev kept everything; session unchanged (${summarize(result)})`);
-      }
-      if (reductionRatio(result) < config.minReductionRatio) {
-        return await skipWith($, gate, 
-          `${tag}: reduction below the ${percent(config.minReductionRatio)} minimum; session unchanged (${summarize(result)})`,
+      let result: CompactResult | undefined;
+      let rebuilt: ReturnType<typeof toSessionMessages>;
+      if (eligible > 0 || assistantEligible > 0) {
+        await sayNotice(
+          $,
+          gate,
+          `${tag}: Jev compaction of ${eligible} tool call(s)` +
+            (assistantEligible > 0 ? ` and ${assistantEligible} assistant text(s)` : '') +
+            `, ${pinned} pinned; Claude summary off`,
         );
+        const config: HookConfig = {
+          ...configured,
+          recentlyReviewedToolUseIds: [...reviewedToolUseIds],
+          apiKey: await getApiKey($, configured),
+        };
+        const goal = compactionGoal(input, configured, event.instructions);
+        if (goal) config.goal = goal;
+        const compaction = await compactSession(
+          input,
+          config,
+          async (url, init) => {
+            const response = await $.http.fetch(url, init);
+            return { status: response.status, ok: response.ok, text: response.text, headers: response.headers };
+          },
+          (line) => $.ui.log(line),
+          transport,
+          (ms) => $.clock.sleep(ms),
+          {
+            request: (index, planned) =>
+              progressNotice($, gate, `${tag}: Jev request ${index}/${planned}, ${Math.round((Date.now() - started) / 1000)} s`),
+          },
+          (ms) => {
+            const controller = new AbortController();
+            const expired = $.clock.sleep(ms, { signal: controller.signal });
+            return { expired, cancel: () => controller.abort() };
+          },
+        );
+        result = compaction.result;
+        rebuilt = compaction.rebuild;
+        for (const id of result.reviewedToolUseIds) reviewedToolUseIds.add(id);
+        if (result.stats.deferred === 0) reviewedToolUseIds.clear();
+        for (const line of decisionLogLines(result)) $.ui.log(line);
+        const jevCut = result.stats.requests > 0 && reductionRatio(result) > 0;
+        if (!jevCut && !structural) {
+          return await skipWith($, gate, `${tag}: Jev kept everything; session unchanged (${summarize(result)})`);
+        }
+        if (jevCut && reductionRatio(result) < config.minReductionRatio && !structural) {
+          return await skipWith($, gate,
+            `${tag}: reduction below the ${percent(config.minReductionRatio)} minimum; session unchanged (${summarize(result)})`,
+          );
+        }
+      } else {
+        rebuilt = toSessionMessages(input);
       }
+
+      const visibleBefore = visibleTokens(event.messages);
+      const visibleAfter = visibleTokens(rebuilt.messages as Message[]);
+      const parts = [
+        result ? summarize(result) : 'no Jev request needed',
+        ...repairs,
+        rebuilt.orphanCalls > 0 ? `${rebuilt.orphanCalls} call(s) without a result dropped` : '',
+      ].filter(Boolean);
       await sayNotice(
         $,
         gate,
-        `${tag}: kept ${messages.length}/${event.messages.length} messages in ${Math.round((Date.now() - started) / 1000)} s, no summary (${summarize(result)}; ${transportSummary(transport)})`,
+        `${tag}: done in ${Math.round((Date.now() - started) / 1000)} s, no summary; ` +
+          `${sizeReport(tokensBefore, visibleBefore, visibleAfter, rebuilt.thinkingRows, deduped.toolCalls + deduped.texts > 0)}. ${parts.join('; ')}` +
+          (result ? `; ${transportSummary(transport)}` : ''),
       );
+      if (sessionId && (restoring.restored.length > 0 || restoring.present.length > 0)) {
+        await forgetQueued($, sessionId, [...restoring.restored, ...restoring.present]);
+      }
       if (tokensBefore !== undefined && event.trigger !== 'precompute') {
-        effectPending = tokensBefore;
+        effectPending = deduped.toolCalls + deduped.texts > 0 ? {} : { before: tokensBefore };
         // Manual compaction also starts the auto-compaction cooldown.
         lastAutoTokens = tokensBefore;
       }
-      return { messages };
+      return { messages: rebuilt.messages };
     } catch (error) {
+      if (error instanceof TurnInProgressError) {
+        return await skipWith($, gate, `${tag}: ${error.message}; session unchanged, compaction runs between turns`);
+      }
       return await skipWith($, gate, `${tag}: Jev compaction failed, session unchanged, no Claude summary (${errorText(error)})`);
     }
+  });
+
+  // A message the user sends mid-turn reaches the model as an attachment of
+  // the next tool result, which a rebuilt tool result does not carry. Recorded
+  // here, it is put back as user text at the next compaction.
+  on('prompt.submit', async ($, event, next) => {
+    const answer = await next(event);
+    if (event.turnId === undefined || answer.drop !== undefined || !HUMAN_ORIGINS.has(event.origin.kind)) return answer;
+    try {
+      const messages = await $.session.messages();
+      const after = messages.flatMap((message) => message.toolUses).at(-1)?.tool_use_id;
+      await rememberQueued($, await $.session.id(), { text: answer.text, ...(after ? { after } : {}), at: Date.now() });
+    } catch (error) {
+      logNotice($, `fast-jev ${LOCAL_BUILD}: could not record a mid-turn message (${errorText(error)})`);
+    }
+    return answer;
   });
 
   // Auto-compaction through Jev. The engine's own auto-compact (a Claude
@@ -590,10 +699,15 @@ export const register: Register = (on: On, options: PluginOptions) => {
       const { context } = await $.session.usage();
       if (context.tokens === undefined || context.percent === undefined) return answer;
       if (effectPending !== undefined) {
+        const { before } = effectPending;
+        const saved = before === undefined ? 0 : before - context.tokens;
         await sayNotice(
           $,
           gate,
-          `fast-jev ${LOCAL_BUILD}: first request after compaction carried ${tokensText(context.tokens)} tokens (before: ${tokensText(effectPending)})`,
+          `fast-jev ${LOCAL_BUILD}: first request after compaction carried ${tokensText(context.tokens)} tokens` +
+            (before === undefined
+              ? ' (the size before it was not measured after the reload)'
+              : ` (before: ${tokensText(before)}; ${saved > 0 ? `−${tokensText(saved)}, −${percent(saved / before)}` : 'no reduction'}, this turn's new messages included)`),
         );
         effectPending = undefined;
       }

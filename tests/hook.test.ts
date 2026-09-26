@@ -70,7 +70,7 @@ describe('hook config', () => {
 });
 
 describe('session message mapping', () => {
-  it('returns the engine objects for untouched messages and handle-less copies for rebuilt ones', () => {
+  it('keeps the engine objects only for user text and rebuilds every tool and assistant message', () => {
     const messages = transcript();
     const calls = collectToolCalls(messages, 0);
     const decisions = [
@@ -79,34 +79,18 @@ describe('session message mapping', () => {
     ];
     messages[1]!.toolUses[0]!.text = 'x'.repeat(2000);
     messages[2]!.toolResults![0]!.text = 'x'.repeat(2000);
-    const out = toSessionMessages(messages, applyDecisions(messages, decisions, calls, 300));
-    expect(out).toHaveLength(messages.length);
+    const { messages: out } = toSessionMessages(applyDecisions(messages, decisions, calls, 300));
+    expect(out.map((m) => m.handle)).toEqual(['h-0', undefined, undefined, undefined, undefined, undefined, 'h-6']);
     expect(out[0]).toBe(messages[0]);
-    expect(out[1]?.handle).toBeUndefined();
-    expect(out[1]?.toolUses[0]?.text).toMatch(
-      new RegExp(`^${'x'.repeat(300)}\\n\\[fast-jev-compaction truncated 1400 of 2000 chars`),
-    );
-    expect(out[2]?.handle).toBeUndefined();
+    expect(out[1]).toEqual({ role: 'assistant', text: '', toolUses: [{ tool_use_id: 'tool-1', tool: 'Read', input: { file_path: 'src/a.ts' } }] });
     expect(out[2]?.toolResults?.[0]?.text).toMatch(
       new RegExp(`^${'x'.repeat(300)}\\n\\[fast-jev-compaction truncated 1400 of 2000 chars`),
     );
     expect(out[2]?.toolResults?.[0]).toMatchObject({ tool_use_id: 'tool-1', isError: false });
-    expect(out[3]).toBe(messages[3]);
-    expect(out[4]).toBe(messages[4]);
-  });
-
-  it('preserves short dropped-result messages and their handles', () => {
-    const messages = transcript();
-    messages[1]!.toolUses[0]!.text = 'y'.repeat(100);
-    messages[2]!.toolResults![0]!.text = 'y'.repeat(100);
-    const calls = collectToolCalls(messages, 0);
-    const decisions = [
-      decideCall(calls[0]!, { keepCall: 0.9, keepResult: 0.1 }, { keepThreshold: 0.5 }),
-      decideCall(calls[1]!, { keepCall: 0.9, keepResult: 0.9 }, { keepThreshold: 0.5 }),
-    ];
-    const out = toSessionMessages(messages, applyDecisions(messages, decisions, calls, 300));
-    expect(out[1]).toBe(messages[1]);
-    expect(out[2]).toBe(messages[2]);
+    expect(out[3]).toEqual({ role: 'assistant', text: '', toolUses: [{ tool_use_id: 'tool-2', tool: 'Bash', input: { command: 'npm test' } }] });
+    expect(out[4]?.toolResults).toEqual([{ tool_use_id: 'tool-2', text: 'FAIL b.test.ts: expected 2 to be 3', isError: true }]);
+    expect(out[5]).toEqual({ role: 'assistant', text: 'Fixing now.', toolUses: [] });
+    expect(out[6]).toBe(messages[6]);
   });
 });
 
@@ -123,9 +107,11 @@ describe('compactSession', () => {
 
     expect(compacted.decisions[0]?.action).toBe('drop_result');
     expect(compacted.stats.charsAfter).toBeLessThan(compacted.stats.charsBefore);
+    // The engine gave the outcome only on the call: it comes back as a real result.
     expect(after[1]?.handle).toBeUndefined();
-    expect(after[1]?.toolUses[0]?.text).toContain('[fast-jev-compaction truncated ');
-    expect(after[1]?.toolUses[0]?.text?.length).toBeLessThan(output.length);
+    expect(after[2]?.toolResults?.[0]?.tool_use_id).toBe('inline-bash');
+    expect(after[2]?.toolResults?.[0]?.text).toContain('[fast-jev-compaction truncated ');
+    expect(after[2]?.toolResults?.[0]?.text.length).toBeLessThan(output.length);
   });
 
   it('runs the library over the engine fetch and reports the outcome', async () => {
@@ -139,8 +125,9 @@ describe('compactSession', () => {
     expect(bodies).toHaveLength(1);
     expect(JSON.parse(bodies[0]!).model).toBe('jev-x');
     expect(output.decisions.map((d) => d.action)).toEqual(['drop_call', 'keep']);
-    expect(messages.map((m) => m.handle)).toEqual(['h-0', 'h-tool-2', 'r-tool-2', 'h-5', 'h-6']);
-    expect(summarize(output)).toMatch(/^\d+% reduction; 1 kept, 1 call_dropped; state ~\d+ tokens \(max-over-shards; up to 1 evidence shard\(s\); .*\) in 1 request\(s\)$/);
+    expect(messages.map((m) => m.handle)).toEqual(['h-0', undefined, undefined, undefined, 'h-6']);
+    expect(messages[3]).toEqual({ role: 'assistant', text: 'Fixing now.', toolUses: [] });
+    expect(summarize(output)).toBe('Jev checked 1 of 1 candidate(s): 1 call(s) dropped, 0 kept in 1 request(s)');
     expect(decisionLog(output)).toBe('t1:Read:drop_call/call=0.10/result=0.10 t2:Bash:keep/call=1.00/result=1.00');
     expect(decisionLogLines(output)).toEqual([`decisions: ${decisionLog(output)}`]);
   });
