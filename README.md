@@ -1,14 +1,35 @@
 # fast-jev-compaction-local
 
-Локальный форк `fast-jev-compaction` для Claude Code function hooks. Он заменяет summarization-style
-compaction на Jev-решения по tool history: старые `tool_use/tool_result` оцениваются по
-информационной релевантности, а сохранённые сообщения остаются verbatim.
+Форк [`tamaratran/fast-jev-compaction`](https://github.com/tamaratran/fast-jev-compaction) 0.3.0
+для Claude Code function hooks. Как и оригинал, он заменяет summarization-style compaction
+Jev-решениями по tool history: сохранённые сообщения остаются verbatim.
 
-Документация local fork:
+> A heavily reworked fork of fast-jev-compaction 0.3.0 (about 3x the code and tests). Docs are in Russian.
 
-- `CLAUDE.md` — инварианты и правила для агента;
+## Чем отличается от upstream
+
+- **Критерий Jev** — информационная релевантность для корректного продолжения разговора, а не
+  «хранить ли verbatim / можно ли перезапустить инструмент». Вопрос о результате получает
+  реальный head/tail preview.
+- **Выгрузка вместо удаления.** Всё урезанное или свёрнутое пишется на страницу
+  (`~/.claude/fast-jev-pages/<сессия>/<tool_use_id>.call.txt`), а заметка в контексте называет
+  файл; вернуть можно одним Read. Текст, набранный пользователем, не удаляется никогда.
+- **Что остаётся, решает содержимое** (вопрос `keep_or_page`), а не целевая доля окна;
+  `ceilingPercent` — только потолок против повторной автокомпакции.
+- **Размеры в токенах Claude**; накладные расходы берутся из первого запроса после прошлой
+  компакции.
+- **Длинная история** покрывается evidence shards под лимиты Jev, score target = MAX по shards;
+  запросы последовательные, с retry.
+- **Никогда не уходит во встроенное саммари Claude**: при ошибке Jev сессия не меняется;
+  есть выключатель встроенного `/compact` (`guard/`).
+- Автокомпакция после закрытия хода, корректный replay ветки транскрипта, нет задвоения
+  истории после reload.
+- Инструменты замера и отладки в `scripts/` (replay, evaluate, jev-experiment, verify-transcript).
+
+Документация:
+
 - `OPERATIONS.md` — установка, update, validation, rollback;
-- `CONTEXT.md` — причины форка, архитектурные решения и проверенные наблюдения;
+- `CONTEXT.md` — причины форка, архитектурные решения и проверенные наблюдения (журнал local.N);
 - `hooks/README.md` — детали function-hook surface.
 
 ## Текущее поведение
