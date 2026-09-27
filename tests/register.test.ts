@@ -137,14 +137,14 @@ describe('session.compact never hands over to the Claude summary', () => {
     expect(toasts.at(-1)).toContain(`fast-jev ${LOCAL_BUILD} [plugin]`);
   });
 
-  it('drops old thinking even when Jev keeps every tool result, and says the size is a bound', async () => {
+  it('drops old thinking even when Jev keeps every tool result, and reports the size in Claude tokens', async () => {
     const { handlers, $, toasts } = engine({ fetch: jevAnswer(0.99), context: () => ({ tokens: 400_000, percent: 40, window: 1_000_000 }) });
     const messages = transcript();
     messages.splice(1, 0, message('assistant', '', { handle: 'thinking' }));
     const result = await handlers['session.compact']!($, { trigger: 'manual', messages }, nextNeverCalled);
     expect(result.messages).toBeDefined();
     expect(result.messages.some((m: SessionMessage) => m.handle === 'thinking')).toBe(false);
-    expect(toasts.at(-1)).toMatch(/context 400k → under \d+k tokens \(−\d+ of messages and 1 thinking block\(s\) of unknown size/);
+    expect(toasts.at(-1)).toMatch(/context 400k → ≈\d+k tokens \(−\d+k? of messages, ≈−480 of 1 thinking block\(s\); the next reply shows the exact size\. Claude Code's own "saved N tokens" line is characters\/4/);
   });
 
   it('heals a transcript an earlier compaction doubled, without asking Jev', async () => {
@@ -194,10 +194,12 @@ describe('session.compact never hands over to the Claude summary', () => {
     const { handlers, $, toasts, written } = engine({ fetch: jevAnswer(0.001) });
     const messages = bashTranscript();
     const result = await handlers['session.compact']!($, { trigger: 'manual', messages }, nextNeverCalled);
-    const page = 'C:/Users/me/.claude/fast-jev-pages/session-1/t1.txt';
-    expect(written.get(page)).toBe(messages[1]!.toolUses[0]!.text);
+    const page = 'C:/Users/me/.claude/fast-jev-pages/session-/t1.call.txt';
+    expect(written.get(page)).toContain(`=== result (ok, ${messages[1]!.toolUses[0]!.text!.length} chars) ===
+${messages[1]!.toolUses[0]!.text}`);
+    expect(written.get(page)).toContain('--- command ---\nnpm test');
     const texts = result.messages.flatMap((m: SessionMessage) => (m.toolResults ?? []).map((r) => r.text));
-    expect(texts.some((t: string) => t.includes(`the full text is in ${page}`))).toBe(true);
+    expect(texts.some((t: string) => t.includes(`full text: ${page} (Read it when the missing part matters; do not re-run the call for it)`))).toBe(true);
 
     const allowed = await handlers['tool.check']!($, { tool: 'Read', input: { file_path: page.replaceAll('/', '\\') } }, async () => ({ decision: 'ask' }));
     expect(allowed).toMatchObject({ decision: 'allow' });
@@ -208,7 +210,7 @@ describe('session.compact never hands over to the Claude summary', () => {
     expect(toasts.some((t) => /1 page-in\(s\) since the last compaction/.test(t))).toBe(true);
   });
 
-  it('pages out an old Write input to its own page', async () => {
+  it('pages out an old Write input to the page of its call', async () => {
     const { handlers, $, toasts, written } = engine({ fetch: jevAnswer(0.99) });
     const content = 'const x = 1;\n'.repeat(300);
     const messages = [
@@ -219,11 +221,28 @@ describe('session.compact never hands over to the Claude summary', () => {
       message('user', 'next', { handle: 'h4' }),
     ];
     const result = await handlers['session.compact']!($, { trigger: 'manual', messages }, nextNeverCalled);
-    const page = 'C:/Users/me/.claude/fast-jev-pages/session-1/w1.input.txt';
+    const page = 'C:/Users/me/.claude/fast-jev-pages/session-/w1.call.txt';
     expect(written.get(page)).toContain(content);
     const input = result.messages[1].toolUses[0].input.content as string;
-    expect(input).toContain(`the whole input is in ${page}`);
-    expect(toasts.at(-1)).toMatch(/1 old Write\/Edit input\(s\) paged out/);
+    expect(input).toContain(`whole call: ${page}`);
+    expect(toasts.at(-1)).toMatch(/1 old call input\(s\) paged out/);
+  });
+
+  it('collapses old calls to reach the size target, and never rewrites a page', async () => {
+    const context = () => ({ tokens: 400_000, percent: 40, window: 1_000_000 });
+    const { handlers, $, toasts, written } = engine({ fetch: jevAnswer(0.99), context });
+    const page = 'C:/Users/me/.claude/fast-jev-pages/session-/t1.call.txt';
+    // A page an earlier compaction wrote holds the whole call; it stays.
+    written.set(page, 'the earlier, whole page');
+    ($.fs as Record<string, unknown>).list = async (dir: string) =>
+      [...written.keys()].filter((p) => p.startsWith(`${dir}/`)).map((p) => ({ name: p.slice(dir.length + 1) }));
+    const result = await handlers['session.compact']!($, { trigger: 'manual', messages: bashTranscript() }, nextNeverCalled);
+    expect(written.get(page)).toBe('the earlier, whole page');
+    const input = result.messages.flatMap((m: SessionMessage) => m.toolUses).find((t: { tool_use_id: string }) => t.tool_use_id === 't1');
+    expect(input.input).toEqual({ command: 'npm test' });
+    const text = result.messages.flatMap((m: SessionMessage) => m.toolResults ?? []).find((r: { tool_use_id: string }) => r.tool_use_id === 't1').text;
+    expect(text).toMatch(/^\[fast-jev-compaction paged out this Bash call \(input and 2000 chars of output\): C:\/Users\/me\/\.claude\/fast-jev-pages\/session-\/t1\.call\.txt\]\nexport const a = 1;/);
+    expect(toasts.at(-1)).toMatch(/1 old call\(s\) collapsed to reach the size target/);
   });
 
   it('names the transcript when a page cannot be written', async () => {

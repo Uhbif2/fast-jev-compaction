@@ -68,7 +68,8 @@ export interface CallAnswer {
   keepResult: number;
 }
 
-export type CallAction = 'keep' | 'drop_result' | 'drop_call';
+/** `collapse`: the call stays as its tool, short input fields and a note naming its page. */
+export type CallAction = 'keep' | 'drop_result' | 'drop_call' | 'collapse';
 
 export interface CallDecision extends CallAnswer {
   id: string;
@@ -149,22 +150,23 @@ export interface CompactOptions {
   /** Also score old assistant text for relevance; user text is never removed. Default false. */
   compactAssistantText?: boolean;
   /**
-   * Where the full text of a shortened result can be read back, named in its
-   * note: `page(tool_use_id)` is a file the host writes, `transcript` the
-   * session's .jsonl. Absent, the note names neither path.
-   */
-  /**
-   * Tokens of visible content the compaction should take out at least. Jev's
-   * scores are well ordered but poorly calibrated (most sit in 0.5–0.7), so
-   * a threshold alone either keeps nearly everything or nearly nothing.
-   * With a target, results are paged out lowest score first until it is met;
-   * paging keeps the whole output one file read away, so this loses nothing.
+   * Claude tokens of messages the compaction should take out at least (the
+   * host subtracts what leaves anyway: thinking, duplicates). Jev's scores
+   * are well ordered but poorly calibrated (most sit in 0.5–0.7), so a
+   * threshold alone either keeps nearly everything or nearly nothing. With a
+   * target, old calls are collapsed in Jev's order until it is met; the page
+   * keeps each one whole a file read away, so this loses nothing.
    */
   cutTokens?: number;
+  /**
+   * Where a paged-out call can be read back, named in its note:
+   * `page(tool_use_id)` is a file the host has written with the call's input
+   * and result, `transcript` the session's .jsonl. Without a page nothing is
+   * collapsed and no input is paged out; a truncated result names the
+   * transcript.
+   */
   pages?: {
     page?: (toolUseId: string) => string | undefined;
-    /** The page holding the whole input of an old file-writer call; its long fields are paged out when present. */
-    inputPage?: (toolUseId: string) => string | undefined;
     transcript?: string;
   };
 }
@@ -192,9 +194,9 @@ export interface CompactResult {
   decisions: CallDecision[];
   assistantTextDecisions: AssistantTextDecision[];
   stats: {
-    /** Old file-writer inputs paged out, and the characters that took out. */
+    /** Old calls whose long input fields were paged out, and the characters that took out. */
     inputsPaged: number;
-    /** Results paged out beyond the threshold to reach cutTokens. */
+    /** Calls collapsed to reach cutTokens. */
     pagedForTarget: number;
     inputCharsSaved: number;
     messagesBefore: number;

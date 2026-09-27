@@ -3,6 +3,7 @@ import {
   applyDecisions,
   batchCalls,
   buildJevRequest,
+  collapsedResultText,
   collectToolCalls,
   compact,
   compactMessages,
@@ -10,6 +11,7 @@ import {
   estimateTokens,
   fitBatchStates,
   fitState,
+  isCompactedResult,
   JevClient,
   parseJevResponse,
   questionsFor,
@@ -569,27 +571,55 @@ describe('HTTP client', () => {
 });
 
 describe('size target', () => {
-  it('pages out more results, lowest score first, until the target is met', async () => {
-    const out = (n: number) => `line ${n}\n`.repeat(400);
+  const out = (n: number) => `line ${n}
+`.repeat(400);
+  function session(): Message[] {
     const messages: Message[] = [{ role: 'user', text: 'go', toolUses: [] }];
     for (const n of [1, 2, 3]) {
       messages.push({ role: 'assistant', text: '', toolUses: [{ tool_use_id: `u${n}`, tool: 'Bash', input: { command: `run ${n}` }, text: out(n) }] });
       messages.push({ role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: `u${n}`, text: out(n), isError: false }] });
     }
     messages.push({ role: 'assistant', text: 'done', toolUses: [] }, { role: 'user', text: 'next', toolUses: [] });
-    const scores: Record<string, number> = { t1: 0.7, t2: 0.6, t3: 0.9 };
-    const asker = {
-      ask: async (_s: unknown, questions: Record<string, unknown>) => ({
-        answers: Object.fromEntries(Object.keys(questions).map((k) => [k, { noul: scores[k.replace(/^\w+_/, '')] ?? 1 }])),
-      }),
-    };
-    const none = await compact(messages, asker as never, { preserveRecentMessages: 2 });
+    return messages;
+  }
+  const scores: Record<string, number> = { t1: 0.7, t2: 0.6, t3: 0.9 };
+  const asker = {
+    ask: async (_s: unknown, questions: Record<string, unknown>) => ({
+      answers: Object.fromEntries(Object.keys(questions).map((k) => [k, { noul: scores[k.replace(/^\w+_/, '')] ?? 1 }])),
+    }),
+  };
+  const pages = { page: (id: string) => `P/${id}.call.txt` };
+
+  it('collapses old calls whole, least needed per token first, until the target is met', async () => {
+    const none = await compact(session(), asker as never, { preserveRecentMessages: 2, pages });
     expect(none.stats.pagedForTarget).toBe(0);
-    const one = await compact(messages, asker as never, { preserveRecentMessages: 2, cutTokens: 500 });
+    const one = await compact(session(), asker as never, { preserveRecentMessages: 2, cutTokens: 500, pages });
     expect(one.stats.pagedForTarget).toBe(1);
-    expect(one.decisions.find((d) => d.reason === 'paged_for_target')?.id).toBe('t2');
-    const all = await compact(messages, asker as never, { preserveRecentMessages: 2, cutTokens: 100_000 });
+    const collapsed = one.decisions.find((d) => d.reason === 'paged_for_target');
+    expect(collapsed).toMatchObject({ id: 't2', action: 'collapse' });
+    const result = one.messages.flatMap((m) => m.toolResults ?? []).find((r) => r.tool_use_id === 'u2')!;
+    expect(result.text).toBe(`[fast-jev-compaction paged out this Bash call (input and ${out(2).length} chars of output): P/u2.call.txt]
+${out(2).replace(/\s+/g, ' ').slice(0, 100)}…`);
+    expect(isCompactedResult(result.text, 'u2')).toBe(true);
+    const all = await compact(session(), asker as never, { preserveRecentMessages: 2, cutTokens: 100_000, pages });
     expect(all.stats.pagedForTarget).toBe(3);
     expect(all.decisions.every((d) => d.action !== 'drop_call')).toBe(true);
+    // Collapsed once, never again.
+    const again = await compact(all.messages, asker as never, { preserveRecentMessages: 2, cutTokens: 100_000, pages });
+    expect(again.stats.pagedForTarget).toBe(0);
+  });
+
+  it('collapses nothing without a page to name', async () => {
+    const result = await compact(session(), asker as never, { preserveRecentMessages: 2, cutTokens: 100_000 });
+    expect(result.stats.pagedForTarget).toBe(0);
+  });
+
+  it('collapses a result an earlier compaction shortened, keeping its original size and reference', () => {
+    const earlier = `first line
+[fast-jev-compaction truncated 5000 of 5600 chars of this Bash result; the original is in T.jsonl, tool_use_id=u9; look it up again if the details are needed]
+last line`;
+    expect(isCompactedResult(earlier, 'u9')).toBe(true);
+    const text = collapsedResultText('Bash', earlier, false, 'P/u9.call.txt');
+    expect(text.startsWith('[fast-jev-compaction paged out this Bash call (input and 5600 chars of output): P/u9.call.txt]\nfirst line')).toBe(true);
   });
 });

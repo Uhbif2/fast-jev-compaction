@@ -66,10 +66,22 @@ export function resultPreview(text: string, chars: number): string {
 /** The marker every fast-jev truncation note starts with. */
 export const COMPACTION_NOTE_MARKER = '[fast-jev-compaction ';
 
+/**
+ * A result an earlier compaction shortened (truncated around a note) or
+ * collapsed (a note and a short head). Only a note of this very call counts:
+ * it names the call's id, or its page, which is named after the id.
+ */
 export function isCompactedResult(text: string, useId: string): boolean {
-  const notes = text.match(/(?:^|\n)\[fast-jev-compaction truncated \d+(?: of \d+)? chars[^\n]*\]/g) ?? [];
-  return notes.some((note) => note.includes(`tool_use_id=${useId};`) ||
+  const notes = text.match(/(?:^|\n)\[fast-jev-compaction (?:truncated \d+(?: of \d+)? chars|paged out this )[^\n]*\]/g) ?? [];
+  return notes.some((note) => note.includes(`tool_use_id=${useId};`) || note.includes(`/${useId}.`) ||
     /^\n?\[fast-jev-compaction truncated \d+ chars of this tool result(?: \(error\))?; re-run the tool if needed\]$/.test(note));
+}
+
+export const COLLAPSED_NOTE = `${COMPACTION_NOTE_MARKER}paged out this `;
+
+/** A call an earlier compaction already collapsed: nothing left to take. */
+export function isCollapsedResult(text: string): boolean {
+  return text.startsWith(COLLAPSED_NOTE);
 }
 
 const READ_ONLY_TOOLS = new Set([

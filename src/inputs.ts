@@ -2,30 +2,26 @@ import { COMPACTION_NOTE_MARKER, isPinned } from './state.js';
 import type { Message, ToolUse } from './types.js';
 
 /**
- * File writers carry the whole text they wrote in their input: a Write its
- * content, an Edit both strings. Once written, that text is history (the file
- * on disk holds the current version, and after a hook's compaction the engine
- * makes the model read a file again before editing it). About an eighth of a
- * long agent session is such input and no Jev question covers it, so old
- * writer inputs are paged out deterministically: each long field keeps its
- * ends and a note naming the page that holds the whole input. Nothing is
- * lost, so no relevance judgment is needed.
+ * A call's input is history once the call has run: a Write carries the whole
+ * file it wrote, an Edit both strings, a Bash call the script it ran (agents
+ * write whole programs into heredocs). On a real session (94aba319, 27.09)
+ * old inputs were 170k of the 300k tokens of messages, Bash alone 88k, and
+ * no Jev question covers them. So every long field of an old input is paged
+ * out deterministically: it keeps its ends and a note naming the call's page,
+ * which holds the input whole. Nothing is lost, so no relevance judgment is
+ * needed.
  */
-const WRITER_FIELDS: Record<string, readonly string[]> = {
-  Write: ['content'],
-  Edit: ['old_string', 'new_string'],
-  NotebookEdit: ['new_source'],
-};
+const FILE_WRITERS = new Set(['Write', 'Edit', 'MultiEdit', 'NotebookEdit']);
 
-const NOTE_PREFIX = `${COMPACTION_NOTE_MARKER}paged out `;
+export const INPUT_NOTE_PREFIX = `${COMPACTION_NOTE_MARKER}paged out `;
 
+/** Top-level string fields of any input, and the strings of MultiEdit's edits. */
 function fieldsOf(tool: ToolUse): Array<{ path: string; value: string }> {
   const out: Array<{ path: string; value: string }> = [];
-  for (const field of WRITER_FIELDS[tool.tool] ?? []) {
-    const value = tool.input[field];
-    if (typeof value === 'string') out.push({ path: field, value });
+  for (const [key, value] of Object.entries(tool.input)) {
+    if (typeof value === 'string') out.push({ path: key, value });
   }
-  if (tool.tool === 'MultiEdit' && Array.isArray(tool.input['edits'])) {
+  if (Array.isArray(tool.input['edits'])) {
     tool.input['edits'].forEach((edit, index) => {
       for (const field of ['old_string', 'new_string']) {
         const value = (edit as Record<string, unknown> | null)?.[field];
@@ -37,32 +33,35 @@ function fieldsOf(tool: ToolUse): Array<{ path: string; value: string }> {
 }
 
 function long(value: string, keep: number): boolean {
-  return value.length > keep * 2 + 400 && !value.includes(NOTE_PREFIX);
+  return value.length > keep * 2 + 400 && !value.includes(INPUT_NOTE_PREFIX);
 }
 
-/** The whole input as a page: every field, readable, not JSON-escaped. */
-export function writerInputPage(tool: ToolUse): string {
-  const lines = [`${tool.tool} input of tool_use_id=${tool.tool_use_id}`];
+/**
+ * The page of one call: its input and its result as the compaction first saw
+ * them, readable, not JSON-escaped. A result shortened by an earlier version
+ * still carries that version's note, which names where the original is.
+ */
+export function callPage(tool: ToolUse, result?: { text: string; isError?: boolean }): string {
+  const lines = [`${tool.tool} call, tool_use_id=${tool.tool_use_id}`, '=== input ==='];
   for (const [key, value] of Object.entries(tool.input)) {
-    if (typeof value === 'string') lines.push(`=== ${key} ===`, value);
-    else lines.push(`=== ${key} (JSON) ===`, JSON.stringify(value, null, 1));
+    if (typeof value === 'string') lines.push(`--- ${key} ---`, value);
+    else lines.push(`--- ${key} (JSON) ---`, JSON.stringify(value, null, 1));
   }
+  if (result) lines.push(`=== result (${result.isError ? 'error' : 'ok'}, ${result.text.length} chars) ===`, result.text);
   return lines.join('\n') + '\n';
 }
 
-export type WriterInputCandidate = { tool_use_id: string; page: string };
-
-/** Old writer calls with at least one long field: what a compaction would page out. */
-export function writerInputCandidates(
+/** Old calls with at least one long input field: what a compaction pages out anyway. */
+export function longInputCalls(
   messages: readonly Message[],
   preserveRecentMessages: number,
   keepChars: number,
-): WriterInputCandidate[] {
-  const out: WriterInputCandidate[] = [];
+): string[] {
+  const out: string[] = [];
   messages.forEach((message, index) => {
     if (message.role !== 'assistant' || isPinned(index, messages.length, preserveRecentMessages)) return;
     for (const tool of message.toolUses) {
-      if (fieldsOf(tool).some((f) => long(f.value, keepChars))) out.push({ tool_use_id: tool.tool_use_id, page: writerInputPage(tool) });
+      if (fieldsOf(tool).some((f) => long(f.value, keepChars))) out.push(tool.tool_use_id);
     }
   });
   return out;
@@ -70,23 +69,23 @@ export function writerInputCandidates(
 
 function shorten(value: string, keep: number, tool: ToolUse, field: string, page: string): string {
   const cut = value.length - keep * 2;
-  const note = `${NOTE_PREFIX}${cut} of ${value.length} chars of ${field} of this ${tool.tool} input (it was applied as written); ` +
-    `the whole input is in ${page}, tool_use_id=${tool.tool_use_id}; the file itself holds the current text]`;
+  const done = FILE_WRITERS.has(tool.tool) ? 'applied as written; the file holds the current text' : 'it ran as written';
+  const note = `${INPUT_NOTE_PREFIX}${cut} of ${value.length} chars of ${field} of this ${tool.tool} input (${done}); whole call: ${page}]`;
   return [value.slice(0, keep), note, value.slice(-keep)].filter(Boolean).join('\n');
 }
 
-export type WriterPaging = { messages: Message[]; paged: number; charsSaved: number };
+export type InputPaging = { messages: Message[]; paged: number; charsSaved: number };
 
 /**
- * Replaces the long fields of old writer inputs whose page exists. Untouched
+ * Replaces the long fields of old inputs whose page exists. Untouched
  * messages keep their identity; a touched one is a new object.
  */
-export function pageWriterInputs(
+export function pageLongInputs(
   messages: readonly Message[],
   preserveRecentMessages: number,
   keepChars: number,
   page: (toolUseId: string) => string | undefined,
-): WriterPaging {
+): InputPaging {
   let paged = 0;
   let charsSaved = 0;
   const out = messages.map((message, index) => {
@@ -114,4 +113,26 @@ export function pageWriterInputs(
     return changed ? { ...message, toolUses } : message;
   });
   return { messages: out, paged, charsSaved };
+}
+
+/** Longest a field of a collapsed call's input stays. */
+const COLLAPSED_FIELD_CHARS = 100;
+
+/**
+ * The input a collapsed call keeps: every field, each cut to its first 100
+ * characters (a Bash description, a path, a pattern survive whole). What the
+ * call did stays readable; the whole input is on the page its result names.
+ */
+export function collapsedInput(input: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(input)) {
+    if (typeof value === 'string') {
+      const flat = value.length > COLLAPSED_FIELD_CHARS ? value.replace(/\s+/g, ' ').trim() : value;
+      out[key] = flat.length > COLLAPSED_FIELD_CHARS ? `${flat.slice(0, COLLAPSED_FIELD_CHARS)}…` : flat;
+    } else {
+      const json = JSON.stringify(value) ?? '';
+      out[key] = json.length > COLLAPSED_FIELD_CHARS ? `[${json.length} chars]` : value;
+    }
+  }
+  return out;
 }
