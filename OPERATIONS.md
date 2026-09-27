@@ -119,7 +119,9 @@ claude plugin validate .claude-plugin/plugin.json
 Toast'ы плагина начинаются с `fast-jev <LOCAL_BUILD> [<trigger>]` (`manual` — `/compact`,
 `plugin` — автокомпакция плагина). Отказ и no-op приходят одной строкой причины.
 
-Итог состоявшейся компакции (формат local.16, без замера накладных; числа для примера):
+Итог состоявшейся компакции (формат local.16, без замера накладных; числа для примера; с local.18
+вместо «to reach the size target» пишется «N old call(s) Jev did not keep collapsed to their
+pages», а при срабатывании потолка — отдельная часть про `ceilingPercent`):
 
 ```text
 fast-jev 0.3.0-local.16 [manual]: done in 9 s, no summary; context 400k → ≈150k tokens
