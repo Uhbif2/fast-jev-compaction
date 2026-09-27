@@ -118,17 +118,32 @@ export function pageLongInputs(
 /** Longest a field of a collapsed call's input stays. */
 const COLLAPSED_FIELD_CHARS = 100;
 
+/** Short fields that say what a call was about. */
+const IDENTIFYING_FIELDS = ['description', 'file_path', 'notebook_path', 'path', 'pattern', 'url', 'query'];
+
 /**
- * The input a collapsed call keeps: every field, each cut to its first 100
- * characters (a Bash description, a path, a pattern survive whole). What the
- * call did stays readable; the whole input is on the page its result names.
+ * The input a collapsed call keeps. Short fields stay whole. A long field
+ * becomes its length when a short identifying field (a Bash description, a
+ * path, a pattern) already says what the call was: the head of a heredoc or
+ * of an old_string only costs tokens (measured 27.09: 21k of the 48k chars
+ * of 103 collapsed calls, with 6.5k in identifying fields). Without one, a
+ * long field keeps its first 100 characters. The whole input is on the page
+ * the result names.
  */
 export function collapsedInput(input: Record<string, unknown>): Record<string, unknown> {
+  const identified = IDENTIFYING_FIELDS.some((key) => {
+    const value = input[key];
+    return typeof value === 'string' && value.trim().length > 0 && value.length <= COLLAPSED_FIELD_CHARS;
+  });
   const out: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(input)) {
     if (typeof value === 'string') {
-      const flat = value.length > COLLAPSED_FIELD_CHARS ? value.replace(/\s+/g, ' ').trim() : value;
-      out[key] = flat.length > COLLAPSED_FIELD_CHARS ? `${flat.slice(0, COLLAPSED_FIELD_CHARS)}…` : flat;
+      if (value.length <= COLLAPSED_FIELD_CHARS) out[key] = value;
+      else if (identified) out[key] = `[${value.length} chars]`;
+      else {
+        const flat = value.replace(/\s+/g, ' ').trim();
+        out[key] = flat.length > COLLAPSED_FIELD_CHARS ? `${flat.slice(0, COLLAPSED_FIELD_CHARS)}…` : flat;
+      }
     } else {
       const json = JSON.stringify(value) ?? '';
       out[key] = json.length > COLLAPSED_FIELD_CHARS ? `[${json.length} chars]` : value;

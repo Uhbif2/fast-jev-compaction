@@ -60,12 +60,19 @@ describe('old call inputs', () => {
     expect(result.stats.charsAfter).toBeLessThan(result.stats.charsBefore);
   });
 
-  it('keeps every field of a collapsed input readable and short', () => {
+  it('keeps short fields, and only the length of a long one a description already names', () => {
     const input = collapsedInput({ command: script, description: 'Run the analysis', timeout: 5, edits: [{ old_string: big }] });
     expect(input['description']).toBe('Run the analysis');
     expect(input['timeout']).toBe(5);
+    expect(input['command']).toBe(`[${script.length} chars]`);
+    expect(input['edits']).toMatch(/^\[\d+ chars\]$/);
+    expect(collapsedInput({ file_path: 'src/a.ts', old_string: big, new_string: 'x' }))
+      .toEqual({ file_path: 'src/a.ts', old_string: `[${big.length} chars]`, new_string: 'x' });
+  });
+
+  it('keeps the head of a long field when nothing short names the call', () => {
+    const input = collapsedInput({ command: script });
     expect((input['command'] as string).length).toBe(101);
     expect(input['command']).toMatch(/^cd \/repo && py -3 - <<'EOF' print\("step"\)/);
-    expect(input['edits']).toMatch(/^\[\d+ chars\]$/);
   });
 });

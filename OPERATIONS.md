@@ -117,7 +117,7 @@ claude plugin validate .claude-plugin/plugin.json
 Toast'ы плагина начинаются с `fast-jev <LOCAL_BUILD> [<trigger>]` (`manual` — `/compact`,
 `plugin` — автокомпакция плагина). Отказ и no-op приходят одной строкой причины.
 
-Итог состоявшейся компакции (с local.16; числа для примера формата):
+Итог состоявшейся компакции (формат local.16, без замера накладных; числа для примера):
 
 ```text
 fast-jev 0.3.0-local.16 [manual]: done in 9 s, no summary; context 400k → ≈150k tokens
@@ -128,7 +128,11 @@ candidate(s): 3 result(s) truncated, 50 kept in 2 request(s); 77 old call input(
 ```
 
 - `context U → ≈A` — U реальный размер последнего запроса, A оценка после, в токенах Claude
-  (2.03 символа на токен, thinking ≈480 на блок; `src/size.ts`). Точно — следующий ответ;
+  (2.03 символа на токен; `src/size.ts`). С local.17, когда есть замер прошлой компакции,
+  рядом стоит `(messages ≈X → ≈Y, plus ≈Z outside them as measured after the last compaction)`:
+  Z — системный промпт, инструменты, списки, CLAUDE.md, вложения и новая реплика, A = Z + Y, и
+  цель для сообщений = `targetPercent`·окно − Z. Без замера (первая компакция на машине) —
+  прежняя формула с thinking ≈480 на блок, она ошибается на ±25k. Точно — следующий ответ;
 - строка движка «Compacted … saved N tokens» и счётчик контекста Desktop до следующего ответа
   показывают `postTokens` движка: символы / 4 без системного промпта и инструментов, примерно
   половина правды. На неё не смотреть;
@@ -147,9 +151,11 @@ candidate(s): 3 result(s) truncated, 50 kept in 2 request(s); 77 old call input(
 с сессией. Блокировки встроенного саммари — `~/.claude/fast-jev-guard.log`.
 
 **Эффект проверять по следующему запросу, а не по boundary.** После компакции, которая
-состоялась, плагин на следующем `turn.complete` показывает «first request after compaction
-carried N tokens (before: M; −D, −P%, …)». Это `usage` реального запроса к API, в него входят и
-новые сообщения этого хода. В `.jsonl` то же видно у первого ответа assistant после boundary:
+состоялась, плагин на первом вызове инструмента следующего хода (или в его конце, если вызовов
+нет) показывает «first request after compaction carried N tokens (before: M; −D, −P%, …); ≈Z of
+it is outside the kept messages …». Это `usage` реального первого запроса к API, в него входит и
+новая реплика. Z запоминается для следующей цели (до local.17 замер шёл в конце хода и в
+длинном ходе включал все его вызовы). В `.jsonl` то же видно у первого ответа assistant после boundary:
 `cache_read_input_tokens + cache_creation_input_tokens + input_tokens`.
 
 `preTokens`/`postTokens` у boundary и строка движка «compacted …» эффекта не показывают:

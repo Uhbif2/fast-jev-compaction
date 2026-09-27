@@ -73,7 +73,7 @@ const timerDeadline: DeadlineWait = (ms) => {
   return { expired, cancel: () => clearTimeout(timer) };
 };
 
-export const LOCAL_BUILD = '0.3.0-local.16';
+export const LOCAL_BUILD = '0.3.0-local.17';
 
 export const JEV_MAX_ATTEMPTS = 6;
 const JEV_RETRY_DELAYS_MS = [1_000, 2_000, 4_000, 8_000, 15_000];
@@ -343,8 +343,17 @@ export function sizeReport(
   visibleAfter: number,
   thinkingRows: number,
   reloaded = false,
+  overhead?: number,
 ): string {
   const cut = Math.max(0, visibleBefore - visibleAfter);
+  // Measured after the last compaction: the context to come is it plus the
+  // kept messages, whatever the thinking and the reloads were.
+  if (overhead !== undefined) {
+    const from = before === undefined || reloaded || visibleBefore > before ? '' : `${tokensText(before)} → `;
+    return `context ${from}≈${tokensText(overhead + visibleAfter)} tokens ` +
+      `(messages ≈${tokensText(visibleBefore)} → ≈${tokensText(visibleAfter)}, plus ≈${tokensText(overhead)} outside them as measured after the last compaction; ` +
+      `the next reply shows the exact size. ${ENGINE_FIGURE_NOTE})`;
+  }
   const thinking = thinkingRows * THINKING_TOKENS_PER_BLOCK;
   const thinkingText = thinkingRows > 0 ? `, ≈−${tokensText(thinking)} of ${thinkingRows} thinking block(s)` : '';
   if (before === undefined) return `≈−${tokensText(cut + thinking)} tokens (−${tokensText(cut)} of messages${thinkingText})`;
@@ -578,6 +587,60 @@ export async function writeCallPages(
 /** Origins of a message a person wrote: typed, from the phone bridge, the Desktop (SDK host), Slack. */
 const HUMAN_ORIGINS = new Set<PromptOrigin['kind']>(['composer', 'bridge', 'sdk', 'slack-ping', 'channel']);
 const QUEUED_KEY = 'queued-prompts';
+
+/**
+ * What the first request after a compaction carried besides its messages:
+ * system prompt, tools, skill and agent listings, CLAUDE.md, attachments the
+ * engine adds back, the new prompt. Measured, not estimated: on 27.09 it was
+ * ~100k of a 133k context, and an estimate from thinking blocks (480 tokens
+ * each, where that session averaged 705) overshot the target by 17k.
+ */
+const OVERHEAD_KEY = 'after-compaction-overhead';
+const OVERHEAD_SAMPLES = 5;
+
+async function measuredOverhead($: StoreTarget): Promise<number | undefined> {
+  try {
+    const value = await $.store.get(OVERHEAD_KEY);
+    const samples = Array.isArray(value) ? value.filter((n): n is number => typeof n === 'number' && n > 0) : [];
+    if (samples.length === 0) return undefined;
+    const sorted = [...samples].sort((a, b) => a - b);
+    return sorted[Math.floor(sorted.length / 2)];
+  } catch {
+    return undefined;
+  }
+}
+
+async function recordOverhead($: StoreTarget, overhead: number): Promise<void> {
+  try {
+    const value = await $.store.get(OVERHEAD_KEY);
+    const samples = Array.isArray(value) ? value.filter((n): n is number => typeof n === 'number') : [];
+    await $.store.set(OVERHEAD_KEY, [...samples, overhead].slice(-OVERHEAD_SAMPLES));
+  } catch {
+    // Only the next target is less exact without it.
+  }
+}
+
+type Effect = { before?: number; visibleAfter: number };
+
+/**
+ * The real size of the first request after a compaction, and what of it lay
+ * outside the kept messages, stored for the next size target.
+ */
+async function reportEffect($: NotifyTarget & StoreTarget, gate: ToastGate, effect: Effect, tokens: number): Promise<void> {
+  const { before, visibleAfter } = effect;
+  const saved = before === undefined ? 0 : before - tokens;
+  const overhead = tokens - visibleAfter;
+  if (overhead > 0) await recordOverhead($, overhead);
+  await sayNotice(
+    $,
+    gate,
+    `fast-jev ${LOCAL_BUILD}: first request after compaction carried ${tokensText(tokens)} tokens` +
+      (before === undefined
+        ? ' (the size before it was not measured after the reload)'
+        : ` (before: ${tokensText(before)}; ${saved > 0 ? `−${tokensText(saved)}, −${percent(saved / before)}` : 'no reduction'}, the new prompt included)`) +
+      (overhead > 0 ? `; ≈${tokensText(overhead)} of it is outside the kept messages (system prompt, tools, listings, CLAUDE.md, attachments, the new prompt), which the next size target counts on` : ''),
+  );
+}
 const QUEUED_PER_SESSION = 50;
 const QUEUED_SESSIONS = 30;
 
@@ -635,9 +698,10 @@ export const register: Register = (on: On, options: PluginOptions) => {
   let lastAutoTokens: number | undefined;
   /**
    * Set when a compaction stood, to report its real effect at the next turn;
-   * `before` is left out when the last measurement predates a reload.
+   * `before` is left out when the last measurement predates a reload;
+   * `visibleAfter` measures the overhead the next target counts on.
    */
-  let effectPending: { before?: number } | undefined;
+  let effectPending: Effect | undefined;
   let lastAutoError = '';
   // Only affects ordering, never a deletion decision. Later passes advance
   // through the remaining candidates instead of rescoring the same large keeps.
@@ -738,12 +802,20 @@ export const register: Register = (on: On, options: PluginOptions) => {
       // it, less what leaves anyway (old thinking, duplicates, command noise).
       // After a reload that doubled the history the last measurement is
       // stale; the messages themselves are the measure then.
+      // With the overhead a previous compaction measured, the target is the
+      // messages' share of it: exact up to the estimate of the messages.
       const reloaded = deduped.toolCalls + deduped.texts > 0;
       const measured = reloaded ? visibleTokens(event.messages) : tokensBefore;
+      const overhead = main ? await measuredOverhead($) : undefined;
       let cutTokens = 0;
-      if (measured !== undefined && window && configured.targetPercent > 0) {
-        const leaving = thinkingRows * THINKING_TOKENS_PER_BLOCK + Math.max(0, visibleTokens(event.messages) - visibleTokens(input));
-        cutTokens = Math.max(0, measured - Math.floor((window * configured.targetPercent) / 100) - leaving);
+      if (window && configured.targetPercent > 0) {
+        const target = Math.floor((window * configured.targetPercent) / 100);
+        if (overhead !== undefined) {
+          cutTokens = Math.max(0, visibleTokens(input) - Math.max(0, target - overhead));
+        } else if (measured !== undefined) {
+          const leaving = thinkingRows * THINKING_TOKENS_PER_BLOCK + Math.max(0, visibleTokens(event.messages) - visibleTokens(input));
+          cutTokens = Math.max(0, measured - target - leaving);
+        }
       }
       const started = Date.now();
       let result: CompactResult | undefined;
@@ -822,7 +894,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
         $,
         gate,
         `${tag}: done in ${Math.round((Date.now() - started) / 1000)} s, no summary; ` +
-          `${sizeReport(tokensBefore, visibleBefore, visibleAfter, rebuilt.thinkingRows, reloaded)}. ${parts.join('; ')}` +
+          `${sizeReport(tokensBefore, visibleBefore, visibleAfter, rebuilt.thinkingRows, reloaded, overhead)}. ${parts.join('; ')}` +
           (result ? `; ${transportSummary(transport)}` : ''),
       );
       if (sessionId && (restoring.restored.length > 0 || restoring.present.length > 0)) {
@@ -830,7 +902,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
       }
       if (main && event.trigger !== 'precompute') pageIns = 0;
       if (tokensBefore !== undefined && event.trigger !== 'precompute') {
-        effectPending = reloaded ? {} : { before: tokensBefore };
+        effectPending = reloaded ? { visibleAfter } : { before: tokensBefore, visibleAfter };
         // Manual compaction also starts the auto-compaction cooldown.
         lastAutoTokens = tokensBefore;
       }
@@ -852,12 +924,30 @@ export const register: Register = (on: On, options: PluginOptions) => {
     if (isPagePath(path, pagesRoot)) return { decision: 'allow', reason: 'fast-jev page of a shortened tool result' };
     return next(event);
   });
-  on('tool.call', { tool: 'Read' }, async ($, event, next) => {
-    pagesRoot ||= await pagesRootOf($);
-    const path = (event as { file_path?: unknown }).file_path;
-    if (event.agentId === undefined && isPagePath(path, pagesRoot)) {
-      pageIns += 1;
-      logNotice($, `fast-jev ${LOCAL_BUILD}: page-in ${pageIns} since the last compaction`);
+  // The real size of the first request after a compaction. At the turn's
+  // first tool call the last response is that request's; a turn without
+  // tools reports it at its end. turn.complete alone would count the calls
+  // of a long turn as overhead.
+  on('tool.call', async ($, event, next) => {
+    if (event.agentId !== undefined) return next(event);
+    if (effectPending !== undefined && !compacting) {
+      try {
+        const { context } = await $.session.usage();
+        const effect = effectPending;
+        if (context.tokens !== undefined && effect !== undefined) {
+          effectPending = undefined;
+          await reportEffect($, gate, effect, context.tokens);
+        }
+      } catch {
+        // Measured at the turn's end instead.
+      }
+    }
+    if (event.tool === 'Read') {
+      pagesRoot ||= await pagesRootOf($);
+      if (isPagePath((event as { file_path?: unknown }).file_path, pagesRoot)) {
+        pageIns += 1;
+        logNotice($, `fast-jev ${LOCAL_BUILD}: page-in ${pageIns} since the last compaction`);
+      }
     }
     return next(event);
   });
@@ -888,18 +978,10 @@ export const register: Register = (on: On, options: PluginOptions) => {
     try {
       const { context } = await $.session.usage();
       if (context.tokens === undefined || context.percent === undefined) return answer;
-      if (effectPending !== undefined) {
-        const { before } = effectPending;
-        const saved = before === undefined ? 0 : before - context.tokens;
-        await sayNotice(
-          $,
-          gate,
-          `fast-jev ${LOCAL_BUILD}: first request after compaction carried ${tokensText(context.tokens)} tokens` +
-            (before === undefined
-              ? ' (the size before it was not measured after the reload)'
-              : ` (before: ${tokensText(before)}; ${saved > 0 ? `−${tokensText(saved)}, −${percent(saved / before)}` : 'no reduction'}, this turn's new messages included)`),
-        );
+      const effect = effectPending;
+      if (effect !== undefined) {
         effectPending = undefined;
+        await reportEffect($, gate, effect, context.tokens);
       }
       if (context.percent < configured.compactAtPercent) return answer;
       if (
