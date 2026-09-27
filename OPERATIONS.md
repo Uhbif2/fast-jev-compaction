@@ -16,7 +16,9 @@ Local marketplace в `~/.claude/settings.json` (`extraKnownMarketplaces`) и
 | option | value |
 |---|---:|
 | `compactAtPercent` | `30` |
-| `targetPercent` | default `15` (local.15): до какой доли окна выгружать, `0` — только порог |
+| `questionVariant` | default `keep_or_page` (local.18): держать в контексте или хватит страницы |
+| `keepAbove` | default `0.4`: оценка, с которой старый вызов остаётся целиком |
+| `ceilingPercent` | default `0` = две трети `compactAtPercent` (при 30 → 20% окна): только потолок |
 | `keepThreshold` | `0.5` |
 | `preserveRecentMessages` | `12` |
 | `minReductionRatio` | `0` |
@@ -131,7 +133,7 @@ candidate(s): 3 result(s) truncated, 50 kept in 2 request(s); 77 old call input(
   (2.03 символа на токен; `src/size.ts`). С local.17, когда есть замер прошлой компакции,
   рядом стоит `(messages ≈X → ≈Y, plus ≈Z outside them as measured after the last compaction)`:
   Z — системный промпт, инструменты, списки, CLAUDE.md, вложения и новая реплика, A = Z + Y, и
-  цель для сообщений = `targetPercent`·окно − Z. Без замера (первая компакция на машине) —
+  потолок для сообщений = `ceilingPercent`·окно − Z. Без замера (первая компакция на машине) —
   прежняя формула с thinking ≈480 на блок, она ошибается на ±25k. Точно — следующий ответ;
 - строка движка «Compacted … saved N tokens» и счётчик контекста Desktop до следующего ответа
   показывают `postTokens` движка: символы / 4 без системного промпта и инструментов, примерно
@@ -141,10 +143,13 @@ candidate(s): 3 result(s) truncated, 50 kept in 2 request(s); 77 old call input(
 - `no Jev request needed` — кандидатов для Jev не было, работали только выгрузка входов,
   сворачивание до цели, thinking и дубли;
 - `N old call input(s) paged out` — длинные поля старых входов (Bash, Write, Edit, …) выгружены;
-- `N old call(s) collapsed to reach the size target` — столько старых вызовов свёрнуто до строки
-  со страницей ради `targetPercent`;
+- `N old call(s) Jev did not keep collapsed to their pages` — старые вызовы с оценкой ниже
+  `keepAbove` (и те, о которых Jev не спрашивали: мелкие, урезанные раньше) свёрнуты до строки со
+  страницей;
+- `N more collapsed to stay under the ceiling` — оставленные Jev вызовы, свёрнутые ради
+  `ceilingPercent`; при обычной работе этого нет;
 - `N page-in(s) since the last compaction` — сколько раз модель читала страницы после прошлой
-  компакции. Много — выгрузка слишком смелая: поднять `targetPercent`.
+  компакции. Много — выгрузка слишком смелая: понизить `keepAbove`.
 
 Страницы лежат в `~/.claude/fast-jev-pages/<первые 8 символов сессии>/<tool_use_id>.call.txt`
 (до local.16 — `<сессия>/<id>.txt` и `<id>.input.txt`); это данные сессии, удалять их можно вместе
@@ -183,7 +188,10 @@ npx tsx scripts/verify-transcript.ts <session.jsonl>
 токенах Claude, `--before N` — состояние перед N-й границей):
 
 ```text
-npx tsx scripts/composition.ts <session.jsonl> [--before N] [opt:targetPercent=20]
+npx tsx scripts/composition.ts <session.jsonl> [--before N] [opt:ceilingPercent=20]
+npx tsx scripts/hook-replay.ts <session.jsonl> [--before N] [--live] [--overhead 100000] [opt:keepAbove=0.3]
+npx tsx scripts/jev-experiment.ts pick <slices.json> <session.jsonl>...
+npx tsx scripts/jev-experiment.ts run <slices.json> <out.json> keep_or_page 1000
 ```
 
 Чисто, когда `linksIntoHistory`, `sharedMessageIds`, `recoveredOnReload` и дубли равны 0, а

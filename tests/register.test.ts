@@ -93,7 +93,7 @@ function engine(setup: {
     ((name: string, a: Handler | object, b?: Handler) => {
       handlers[name] = (b ?? a) as Handler;
     }) as never,
-    { preserveRecentMessages: 1, compactAtPercent: 30, ...setup.options } as never,
+    { preserveRecentMessages: 1, compactAtPercent: 30, questionVariant: 'relevance', ...setup.options } as never,
   );
   return { handlers, toasts, order, $, stored, written };
 }
@@ -210,6 +210,39 @@ ${messages[1]!.toolUses[0]!.text}`);
     expect(toasts.some((t) => /1 page-in\(s\) since the last compaction/.test(t))).toBe(true);
   });
 
+  it('keep_or_page: keeps what Jev keeps, collapses every other old call, asks only about results', async () => {
+    const asked: string[] = [];
+    const fetch = async (_url: string, init?: { body?: string }) => {
+      const { questions } = JSON.parse(init?.body ?? '{}') as { questions: Record<string, { instructions: { target_call: { id: string } } }> };
+      asked.push(...Object.keys(questions));
+      const answers = Object.fromEntries(Object.entries(questions).map(([k, q]) =>
+        [k, { noul: q.instructions.target_call.id === 't1' ? 0.6 : 0.2 }]));
+      return { status: 200, ok: true, text: JSON.stringify({ answers }), headers: {} };
+    };
+    const { handlers, $, toasts } = engine({ fetch, options: { questionVariant: 'keep_or_page', ceilingPercent: 90 } });
+    const big = 'export const a = 1;\n'.repeat(100);
+    const call = (id: string, command: string, out: string) => [
+      message('assistant', '', { toolUses: [{ tool_use_id: id, tool: 'Bash', input: { command, description: `step ${id}` }, text: out }] }),
+      message('user', '', { toolResults: [{ tool_use_id: id, text: out, isError: false }] }),
+    ];
+    const messages = [
+      message('user', 'Fix it.'),
+      ...call('t1', 'cat a.ts', big),
+      ...call('t2', 'cat b.ts', big),
+      ...call('t3', 'git status', 'On branch master, nothing to commit, working tree clean. '.repeat(10)),
+      message('assistant', 'Read both.'),
+      message('user', 'go on'),
+    ];
+    const result = await handlers['session.compact']!($, { trigger: 'manual', messages }, nextNeverCalled);
+    expect(asked.every((k) => k.startsWith('result_'))).toBe(true);
+    const results = new Map(result.messages.flatMap((m: SessionMessage) => (m.toolResults ?? []).map((r) => [r.tool_use_id, r.text])));
+    expect(results.get('t1')).toBe(big);
+    expect(results.get('t2')).toMatch(/^\[fast-jev-compaction paged out this Bash call/);
+    expect(results.get('t3')).toMatch(/^\[fast-jev-compaction paged out this Bash call/);
+    expect(toasts.at(-1)).toMatch(/2 old call\(s\) Jev did not keep collapsed to their pages/);
+    expect(toasts.at(-1)).not.toMatch(/under the ceiling/);
+  });
+
   it('pages out an old Write input to the page of its call', async () => {
     const { handlers, $, toasts, written } = engine({ fetch: jevAnswer(0.99) });
     const content = 'const x = 1;\n'.repeat(300);
@@ -228,9 +261,9 @@ ${messages[1]!.toolUses[0]!.text}`);
     expect(toasts.at(-1)).toMatch(/1 old call input\(s\) paged out/);
   });
 
-  it('collapses old calls to reach the size target, and never rewrites a page', async () => {
+  it('collapses kept old calls to stay under the ceiling, and never rewrites a page', async () => {
     const context = () => ({ tokens: 400_000, percent: 40, window: 1_000_000 });
-    const { handlers, $, toasts, written } = engine({ fetch: jevAnswer(0.99), context });
+    const { handlers, $, toasts, written } = engine({ fetch: jevAnswer(0.99), context, options: { ceilingPercent: 15 } });
     const page = 'C:/Users/me/.claude/fast-jev-pages/session-/t1.call.txt';
     // A page an earlier compaction wrote holds the whole call; it stays.
     written.set(page, 'the earlier, whole page');
@@ -242,12 +275,12 @@ ${messages[1]!.toolUses[0]!.text}`);
     expect(input.input).toEqual({ command: 'npm test' });
     const text = result.messages.flatMap((m: SessionMessage) => m.toolResults ?? []).find((r: { tool_use_id: string }) => r.tool_use_id === 't1').text;
     expect(text).toMatch(/^\[fast-jev-compaction paged out this Bash call \(input and 2000 chars of output\): C:\/Users\/me\/\.claude\/fast-jev-pages\/session-\/t1\.call\.txt\]\nexport const a = 1;/);
-    expect(toasts.at(-1)).toMatch(/1 old call\(s\) collapsed to reach the size target/);
+    expect(toasts.at(-1)).toMatch(/1 more collapsed to stay under the ceiling/);
   });
 
   it('measures what the context carries besides the messages, and aims the next target with it', async () => {
     let context = { tokens: 400_000, percent: 40, window: 1_000_000 };
-    const { handlers, $, toasts, stored } = engine({ fetch: jevAnswer(0.99), context: () => context });
+    const { handlers, $, toasts, stored } = engine({ fetch: jevAnswer(0.99), context: () => context, options: { ceilingPercent: 15 } });
     await handlers['session.compact']!($, { trigger: 'manual', messages: bashTranscript() }, nextNeverCalled);
     // Thinking and the engine's own additions leave the 400k far from the
     // messages: only the next request says how much the rest is.

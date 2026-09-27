@@ -5,7 +5,11 @@
  * what a headless live run cannot while its OAuth is gone: the rebuild the
  * engine gets, the pages, the notice. Prints counts and the notice only.
  *
- *   npx tsx scripts/hook-replay.ts <session.jsonl> [--before N]
+ *   npx tsx scripts/hook-replay.ts <session.jsonl> [--before N] [--live] [--overhead N] [opt:key=value]
+ *
+ * --live asks the real Jev (TYPESAFE_API_KEY from the environment);
+ * --overhead N stands for what a previous compaction measured outside the
+ * messages; opt: sets a plugin option.
  */
 import { readFileSync } from 'node:fs';
 import { register } from '../hooks/fast-jev.ts';
@@ -16,6 +20,13 @@ if (!path) throw new Error('Usage: npx tsx scripts/hook-replay.ts <session.jsonl
 const rows = readFileSync(path, 'utf8').split(/\r?\n/).filter(Boolean).map((l) => JSON.parse(l));
 const boundaries = rows.filter((r) => r.subtype === 'compact_boundary');
 const at = rest.indexOf('--before');
+const live = rest.includes('--live');
+const overheadAt = rest.indexOf('--overhead');
+const overhead = overheadAt >= 0 ? Number(rest[overheadAt + 1]) : undefined;
+const extra = Object.fromEntries(rest.filter((a) => a.startsWith('opt:')).map((a) => {
+  const [k, v] = a.slice(4).split('=');
+  return [k!, Number.isFinite(Number(v)) ? Number(v) : v];
+}));
 const boundary = boundaries[(at >= 0 ? Number(rest[at + 1]) : boundaries.length) - 1];
 const messages = toMessages(chainTo(rows, boundary.logicalParentUuid)).map((m, i) =>
   m.role === 'user' && !(m.toolResults?.length) ? { ...m, handle: `h${i}` } : m);
@@ -25,16 +36,27 @@ const toasts: string[] = [];
 const handlers: Record<string, (...args: any[]) => Promise<any>> = {};
 const sessionId = rows.find((r) => r.sessionId)?.sessionId ?? '00000000-0000-0000-0000-000000000000';
 const $ = {
-  store: { get: async () => undefined, set: async () => {} },
+  store: { get: async (key: string) => (key === 'after-compaction-overhead' && overhead !== undefined ? [overhead] : undefined), set: async () => {} },
   ui: { log: () => {}, toast: (text: string) => void toasts.push(text) },
-  env: { get: async (name: string) => (name === 'USERPROFILE' ? 'C:/Users/user' : name === 'TYPESAFE_API_KEY' ? 'offline' : undefined) },
+  env: { get: async (name: string) => (name === 'USERPROFILE' ? 'C:/Users/user' : name === 'TYPESAFE_API_KEY' ? (live ? process.env.TYPESAFE_API_KEY : 'offline') : undefined) },
   fs: {
     write: async (file: string, text: string) => void files.set(file, text),
     list: async (dir: string) => [...files.keys()].filter((f) => f.startsWith(`${dir}/`)).map((f) => ({ name: f.slice(dir.length + 1) })),
   },
-  clock: { sleep: async () => {} },
+  clock: {
+    sleep: (ms: number, options?: { signal?: AbortSignal }) => live
+      ? new Promise<void>((done) => {
+        const timer = setTimeout(done, ms);
+        options?.signal?.addEventListener('abort', () => { clearTimeout(timer); done(); });
+      })
+      : Promise.resolve(),
+  },
   http: {
-    fetch: async (_url: string, init?: { body?: string }) => {
+    fetch: async (url: string, init?: { method?: string; headers?: Record<string, string>; body?: string }) => {
+      if (live) {
+        const response = await fetch(url, init as RequestInit);
+        return { status: response.status, ok: response.ok, text: await response.text(), headers: {} };
+      }
       const { questions } = JSON.parse(init?.body ?? '{}') as { questions: Record<string, unknown> };
       const answers = Object.fromEntries(Object.keys(questions).map((k) => [k, { noul: 0.55 + Math.random() * 0.15 }]));
       return { status: 200, ok: true, text: JSON.stringify({ answers }), headers: {} };
@@ -48,7 +70,7 @@ const $ = {
   },
 };
 register(((name: string, a: any, b?: any) => { handlers[name] = b ?? a; }) as never,
-  { keepThreshold: 0.5, preserveRecentMessages: 12, compactAtPercent: 30 } as never);
+  { keepThreshold: 0.5, preserveRecentMessages: 12, compactAtPercent: 30, ...extra } as never);
 
 const started = Date.now();
 const result = await handlers['session.compact']!($, { trigger: 'manual', messages }, async () => {

@@ -38,6 +38,8 @@ export const DEFAULT_OPTIONS: ResolvedCompactOptions = {
   maxRequestTokens: 62_000,
   truncateHeadChars: 300,
   resultPreviewChars: 1_000,
+  questionVariant: 'relevance',
+  keepAbove: 0.4,
   compactAssistantText: false,
   pages: {},
   cutTokens: 0,
@@ -84,6 +86,8 @@ export function resolveOptions(options: CompactOptions = {}): ResolvedCompactOpt
       typeof options.compactAssistantText === 'boolean'
         ? options.compactAssistantText
         : DEFAULT_OPTIONS.compactAssistantText,
+    questionVariant: options.questionVariant === 'keep_or_page' ? 'keep_or_page' : 'relevance',
+    keepAbove: Math.min(1, Math.max(0, finite(options.keepAbove, DEFAULT_OPTIONS.keepAbove))),
     pages: options.pages ?? DEFAULT_OPTIONS.pages,
     cutTokens: Math.max(0, finite(options.cutTokens, DEFAULT_OPTIONS.cutTokens)),
   };
@@ -115,7 +119,8 @@ function laterEvidence(call: ToolCall): Record<string, string> {
  * A side-effecting call's record is never removed, so it gets only the
  * result question.
  */
-export function questionsFor(call: ToolCall): JevQuestions {
+export function questionsFor(call: ToolCall, variant: QuestionVariant = activeVariant): JevQuestions {
+  if (variant === 'keep_or_page') return keepOrPageQuestion(call);
   const targetCall = {
     id: call.id,
     tool: call.tool,
@@ -163,12 +168,51 @@ export function questionsFor(call: ToolCall): JevQuestions {
   };
 }
 
+export type QuestionVariant = 'relevance' | 'keep_or_page';
+
+/** The variant of the compaction running now; compact() sets it for its run. */
+let activeVariant: QuestionVariant = 'relevance';
+
+/**
+ * One question per call: stay in the working context, or is the one-line
+ * record with its page enough. Paging out loses nothing (the page is read back
+ * with one call), so doubt goes to the page, and the cost of keeping is named.
+ */
+function keepOrPageQuestion(call: ToolCall): JevQuestions {
+  return {
+    [`result_${call.id}`]: {
+      type: 'noul',
+      instructions: {
+        question:
+          "Should this historical tool output stay in the model's working context after compaction? If not, it is replaced by a one-line record of the call and a file path: the full output stays on disk and the model reads it back with one tool call if it turns out to be needed.",
+        target_call: {
+          id: call.id,
+          tool: call.tool,
+          input: boundedInput(call.input),
+          ...laterEvidence(call),
+        },
+        result: {
+          chars: call.resultChars,
+          is_error: call.isError,
+          preview: call.resultPreview ?? '',
+        },
+      },
+      criteria: {
+        true:
+          'The next steps of the current work will very likely use specific content of this output directly (the file or error being worked on right now, values the next action needs), or it is the only statement of a fact the current work depends on and later messages do not restate it.',
+        false:
+          'The continuation can go on without this output in view: it belongs to earlier or finished work, later calls or messages superseded or restated it, or it would be needed only occasionally. Every token kept is re-read on every later turn, while reading the file back costs one call; when in doubt, the record and the file are enough.',
+      },
+    },
+  };
+}
+
 function questionTokenStats(batch: readonly ToolCall[]): {
   questions: JevQuestions;
   total: number;
   longest: number;
 } {
-  const questions: JevQuestions = Object.assign({}, ...batch.map(questionsFor));
+  const questions: JevQuestions = Object.assign({}, ...batch.map((call) => questionsFor(call)));
   const sizes = Object.values(questions).map((q: JevQuestion) =>
     estimateTokens(JSON.stringify(q)),
   );
@@ -362,7 +406,7 @@ async function askBatch(
       batch.map((call) => [
         call.id,
         {
-          keepCall: call.sideEffects ? 1 : noulAnswer(answers, `call_${call.id}`),
+          keepCall: call.sideEffects || !(`call_${call.id}` in answers) ? 1 : noulAnswer(answers, `call_${call.id}`),
           keepResult: noulAnswer(answers, `result_${call.id}`),
         },
       ]),
@@ -530,7 +574,7 @@ function callTexts(messages: readonly Message[]): Map<string, CallTexts> {
 }
 
 /**
- * Meets `cutTokens` by collapsing old calls whole: the call keeps its tool,
+ * Collapses old calls whole: the call keeps its tool,
  * its input cut to short fields and a note naming the page that holds input
  * and output whole. Every old call qualifies once its page exists: a small
  * result, a deferred candidate, a result an earlier compaction shortened.
@@ -540,22 +584,28 @@ function callTexts(messages: readonly Message[]): Map<string, CallTexts> {
  * saving. A result shortened before counts 0.25, one Jev never saw 0.5. The
  * probability is also the chance of one page read, so this is the cheapest
  * way to the target in page reads. `baseline` is the conversation after the
- * deterministic paging and the threshold decisions; returns how many
- * decisions it changed, in place.
+ * deterministic paging and the threshold decisions.
+ *
+ * With `keep_or_page` every old call Jev did not keep goes first, whatever
+ * the target: a call Jev never saw (small, deferred, shortened before) counts
+ * as not kept, since its page holds it whole. Then, to meet `cutTokens`, the
+ * kept ones in the same order. Returns the counts changed, in place.
  */
-function collapseForTarget(
+function collapseCalls(
   messages: readonly Message[],
   baseline: readonly Message[],
   calls: readonly ToolCall[],
   decisions: CallDecision[],
   answers: ReadonlyMap<string, CallAnswer>,
   options: ResolvedCompactOptions,
-): number {
+): { pagedOut: number; pagedForTarget: number } {
+  const none = { pagedOut: 0, pagedForTarget: 0 };
   const page = options.pages.page;
-  if (options.cutTokens <= 0 || !page) return 0;
+  const pageOut = options.questionVariant === 'keep_or_page';
+  if ((options.cutTokens <= 0 && !pageOut) || !page) return none;
   const target = options.cutTokens * CHARS_PER_TOKEN;
   let cut = transcriptChars(messages) - transcriptChars(baseline);
-  if (cut >= target) return 0;
+  if (cut >= target && !pageOut) return none;
   const byId = new Map(calls.map((call) => [call.id, call]));
   const now = callTexts(baseline);
   const open = decisions.flatMap((decision) => {
@@ -569,18 +619,21 @@ function collapseForTarget(
       collapsedResultText(call.tool, current.result, current.isError, where).length;
     const saving = before - after;
     if (saving < MIN_COLLAPSE_CHARS) return [];
-    const score = call.compacted ? 0.25 : answers.get(call.id)?.keepResult ?? 0.5;
-    return [{ decision, call, saving, cost: score / saving }];
-  }).sort((a, b) => a.cost - b.cost || a.call.callIndex - b.call.callIndex);
-  let changed = 0;
-  for (const { decision, saving } of open) {
-    if (cut >= target) break;
+    const answered = answers.get(call.id)?.keepResult;
+    const score = call.compacted ? 0.25 : answered ?? 0.5;
+    const unkept = pageOut && (call.compacted || answered === undefined || answered < options.keepAbove);
+    return [{ decision, call, saving, unkept, cost: score / saving }];
+  }).sort((a, b) => Number(b.unkept) - Number(a.unkept) || a.cost - b.cost || a.call.callIndex - b.call.callIndex);
+  const counts = { ...none };
+  for (const { decision, saving, unkept } of open) {
+    if (!unkept && cut >= target) break;
     decision.action = 'collapse';
-    decision.reason = 'paged_for_target';
+    decision.reason = unkept ? 'paged_out' : 'paged_for_target';
     cut += saving;
-    changed += 1;
+    if (unkept) counts.pagedOut += 1;
+    else counts.pagedForTarget += 1;
   }
-  return changed;
+  return counts;
 }
 
 /** Below this many characters a removable call is not worth a Jev question. */
@@ -782,6 +835,7 @@ export async function compact(
 ): Promise<CompactResult> {
   const started = Date.now();
   const resolved = resolveOptions(options);
+  activeVariant = resolved.questionVariant;
   const calls = collectToolCalls(
     messages,
     resolved.preserveRecentMessages,
@@ -926,8 +980,11 @@ export async function compact(
     }
   }
 
+  const threshold = {
+    keepThreshold: resolved.questionVariant === 'keep_or_page' ? resolved.keepAbove : resolved.keepThreshold,
+  };
   const decisions = calls.map((call) =>
-    decideCall(call, answers.get(call.id) ?? { keepCall: 1, keepResult: 1 }, resolved),
+    decideCall(call, answers.get(call.id) ?? { keepCall: 1, keepResult: 1 }, threshold),
   );
   const resultScores: CompactResult['stats']['resultScores'] = [0, 0, 0, 0, 0];
   for (const call of toolCandidates) {
@@ -959,8 +1016,8 @@ export async function compact(
     resolved.pages,
   );
   const thresholded = rebuild();
-  const pagedForTarget = collapseForTarget(messages, thresholded, calls, decisions, answers, resolved);
-  const kept = pagedForTarget > 0 ? rebuild() : thresholded;
+  const collapsed = collapseCalls(messages, thresholded, calls, decisions, answers, resolved);
+  const kept = collapsed.pagedOut + collapsed.pagedForTarget > 0 ? rebuild() : thresholded;
   return {
     reviewedToolUseIds: toolCandidates.filter((call) => answers.has(call.id)).map((call) => call.tool_use_id),
     messages: kept,
@@ -968,7 +1025,8 @@ export async function compact(
     assistantTextDecisions,
     stats: {
       inputsPaged: inputs.paged,
-      pagedForTarget,
+      pagedOut: collapsed.pagedOut,
+      pagedForTarget: collapsed.pagedForTarget,
       inputCharsSaved: inputs.charsSaved,
       messagesBefore: messages.length,
       messagesAfter: kept.length,
