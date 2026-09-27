@@ -1,11 +1,14 @@
 import { noulAnswer } from './request.js';
-import { pageWriterInputs } from './inputs.js';
+import { collapsedInput, pageLongInputs } from './inputs.js';
+import { CHARS_PER_TOKEN } from './size.js';
 import {
   collectToolCalls,
+  COLLAPSED_NOTE,
   COMPACTION_NOTE_MARKER,
   estimateTokens,
   fitBatchStates,
   hasSideEffects,
+  isCollapsedResult,
 } from './state.js';
 import type {
   AssistantTextDecision,
@@ -466,56 +469,106 @@ export function truncatedResultText(
   if (text.length <= head + tail + 200) return text;
   const cut = text.length - head - tail;
   const page = pages.page?.(call.tool_use_id);
+  const rerun = call.sideEffects ? '; do not re-run the call for it' : '';
+  // With a page the note names it (the file is named after the id); without
+  // one it names the transcript and the id to look for.
   const where = page
-    ? `the full text is in ${page} (Read it, with offset/limit if long, whenever the missing part matters)`
-    : `the original is in ${pages.transcript || "this session's transcript (.jsonl)"}`;
-  const advice = call.sideEffects
-    ? 'do not re-run the call just to see its output: that may repeat its side effect'
-    : page ? 'or look it up again' : 'look it up again if the details are needed';
+    ? `full text: ${page} (Read it when the missing part matters${rerun})`
+    : `the original is in ${pages.transcript || "this session's transcript (.jsonl)"}, tool_use_id=${call.tool_use_id};` +
+      (call.sideEffects ? ' do not re-run the call just to see its output: that may repeat its side effect' : ' look it up again if the details are needed');
   const note =
     `${COMPACTION_NOTE_MARKER}truncated ${cut} of ${text.length} chars of this ${call.tool} result` +
-    `${isError ? ' (error)' : ''}; ${where}, tool_use_id=${call.tool_use_id}; ${advice}]`;
+    `${isError ? ' (error)' : ''}; ${where}]`;
   const shortened = [head > 0 ? text.slice(0, head) : '', note, tail > 0 ? text.slice(-tail) : '']
     .filter(Boolean)
     .join('\n');
   return shortened.length < text.length ? shortened : text;
 }
 
+/** Head of the output a collapsed call keeps after its note. */
+const COLLAPSED_HEAD_CHARS = 100;
+
 /**
- * Meets `cutTokens` by paging out more results, lowest Jev score first (on a
- * tie the larger first): Jev's order is informative where its absolute
- * scores are not. Only answered candidates qualify, only their result body
- * goes (the call record stays), and a pinned call never does. Returns how
- * many decisions it changed; they are changed in place.
+ * What a collapsed call's result becomes: one note naming the call's page and
+ * the first characters of the output. For a result an earlier compaction had
+ * shortened, the size is the original's, read from that earlier note, and
+ * the page holds that note, which says where the original is.
  */
-function pageForTarget(
-  decisions: CallDecision[],
+export function collapsedResultText(tool: string, text: string, isError: boolean, page: string): string {
+  const size = Number(/truncated \d+ of (\d+) chars/.exec(text)?.[1] ?? text.length);
+  const flat = text.replace(/\s+/g, ' ').trim();
+  const head = flat.length > COLLAPSED_HEAD_CHARS ? `${flat.slice(0, COLLAPSED_HEAD_CHARS)}…` : flat;
+  const note = `${COLLAPSED_NOTE}${tool} call (input and ${size} chars of ${isError ? 'error ' : ''}output): ${page}]`;
+  return head ? `${note}\n${head}` : note;
+}
+
+/** Below this many characters a collapse is not worth the note it costs. */
+const MIN_COLLAPSE_CHARS = 120;
+
+type CallTexts = { input: Record<string, unknown>; result: string; isError: boolean };
+
+/** Every answered call's current input and result, by tool_use_id. */
+function callTexts(messages: readonly Message[]): Map<string, CallTexts> {
+  const out = new Map<string, CallTexts>();
+  for (const message of messages) for (const tool of message.toolUses) {
+    out.set(tool.tool_use_id, { input: tool.input, result: tool.text ?? '', isError: tool.isError ?? false });
+  }
+  for (const message of messages) for (const result of message.toolResults ?? []) {
+    const entry = out.get(result.tool_use_id);
+    if (entry) out.set(result.tool_use_id, { ...entry, result: result.text, isError: result.isError ?? false });
+  }
+  return out;
+}
+
+/**
+ * Meets `cutTokens` by collapsing old calls whole: the call keeps its tool,
+ * its input cut to short fields and a note naming the page that holds input
+ * and output whole. Every old call qualifies once its page exists: a small
+ * result, a deferred candidate, a result an earlier compaction shortened.
+ *
+ * Which go first minimises what the continuation is likely to miss per token
+ * saved: Jev's keep probability (well ordered, poorly calibrated) over the
+ * saving. A result shortened before counts 0.25, one Jev never saw 0.5. The
+ * probability is also the chance of one page read, so this is the cheapest
+ * way to the target in page reads. `baseline` is the conversation after the
+ * deterministic paging and the threshold decisions; returns how many
+ * decisions it changed, in place.
+ */
+function collapseForTarget(
+  messages: readonly Message[],
+  baseline: readonly Message[],
   calls: readonly ToolCall[],
+  decisions: CallDecision[],
   answers: ReadonlyMap<string, CallAnswer>,
   options: ResolvedCompactOptions,
 ): number {
-  if (options.cutTokens <= 0) return 0;
-  const byId = new Map(calls.map((call) => [call.id, call]));
-  const keep = options.truncateHeadChars * 2 + 250;
-  const saving = (call: ToolCall): number => Math.max(0, call.resultChars - keep);
-  let cut = 0;
-  for (const decision of decisions) {
-    const call = byId.get(decision.id)!;
-    if (decision.action === 'drop_call') cut += call.resultChars + JSON.stringify(call.input).length;
-    else if (decision.action === 'drop_result') cut += saving(call);
-  }
-  // Tool output runs about 3 characters to a token (code, logs, paths).
-  const target = options.cutTokens * 3;
+  const page = options.pages.page;
+  if (options.cutTokens <= 0 || !page) return 0;
+  const target = options.cutTokens * CHARS_PER_TOKEN;
+  let cut = transcriptChars(messages) - transcriptChars(baseline);
   if (cut >= target) return 0;
-  const open = decisions
-    .filter((d) => d.action === 'keep' && d.reason === 'kept' && answers.has(d.id) && saving(byId.get(d.id)!) > MIN_SAVING_CHARS)
-    .sort((a, b) => a.keepResult - b.keepResult || saving(byId.get(b.id)!) - saving(byId.get(a.id)!));
+  const byId = new Map(calls.map((call) => [call.id, call]));
+  const now = callTexts(baseline);
+  const open = decisions.flatMap((decision) => {
+    const call = byId.get(decision.id)!;
+    const current = now.get(call.tool_use_id);
+    const where = page(call.tool_use_id);
+    if (decision.reason === 'pinned' || decision.action === 'drop_call' || !current || !where) return [];
+    if (isCollapsedResult(current.result)) return [];
+    const before = JSON.stringify(current.input).length + current.result.length;
+    const after = JSON.stringify(collapsedInput(current.input)).length +
+      collapsedResultText(call.tool, current.result, current.isError, where).length;
+    const saving = before - after;
+    if (saving < MIN_COLLAPSE_CHARS) return [];
+    const score = call.compacted ? 0.25 : answers.get(call.id)?.keepResult ?? 0.5;
+    return [{ decision, call, saving, cost: score / saving }];
+  }).sort((a, b) => a.cost - b.cost || a.call.callIndex - b.call.callIndex);
   let changed = 0;
-  for (const decision of open) {
+  for (const { decision, saving } of open) {
     if (cut >= target) break;
-    decision.action = 'drop_result';
+    decision.action = 'collapse';
     decision.reason = 'paged_for_target';
-    cut += saving(byId.get(decision.id)!);
+    cut += saving;
     changed += 1;
   }
   return changed;
@@ -585,9 +638,17 @@ export function applyDecisions(
       kept.push(message);
       continue;
     }
+    const collapse = (useId: string) => actions.get(useId) === 'collapse' ? pages.page?.(useId) : undefined;
     const toolUses = message.toolUses
       .filter((tool) => actions.get(tool.tool_use_id) !== 'drop_call')
       .map((tool) => {
+        const page = collapse(tool.tool_use_id);
+        if (page) {
+          const copy: ToolUse = { tool_use_id: tool.tool_use_id, tool: tool.tool, input: collapsedInput(tool.input) };
+          if (tool.text !== undefined) copy.text = collapsedResultText(tool.tool, tool.text, tool.isError ?? false, page);
+          if (tool.isError) copy.isError = true;
+          return copy;
+        }
         if (actions.get(tool.tool_use_id) !== 'drop_result') return tool;
         const text = shorten(tool.text ?? '', tool.isError ?? false, tool.tool_use_id, tool.tool);
         if ((tool.text ?? '') === text) return tool;
@@ -603,6 +664,14 @@ export function applyDecisions(
     const toolResults = (message.toolResults ?? [])
       .filter((result) => actions.get(result.tool_use_id) !== 'drop_call')
       .map((result) => {
+        const page = collapse(result.tool_use_id);
+        if (page) {
+          return {
+            tool_use_id: result.tool_use_id,
+            text: collapsedResultText(byUseId.get(result.tool_use_id)?.tool ?? 'tool', result.text, result.isError ?? false, page),
+            isError: result.isError,
+          };
+        }
         if (actions.get(result.tool_use_id) !== 'drop_result') return result;
         const text = shorten(
           result.text,
@@ -851,7 +920,6 @@ export async function compact(
   const decisions = calls.map((call) =>
     decideCall(call, answers.get(call.id) ?? { keepCall: 1, keepResult: 1 }, resolved),
   );
-  const pagedForTarget = pageForTarget(decisions, calls, answers, resolved);
   const resultScores: CompactResult['stats']['resultScores'] = [0, 0, 0, 0, 0];
   for (const call of toolCandidates) {
     const score = answers.get(call.id)?.keepResult;
@@ -870,26 +938,29 @@ export async function compact(
       .filter((decision) => decision.action === 'drop_text')
       .map((decision) => decision.index),
   );
-  const writers = resolved.pages.inputPage
-    ? pageWriterInputs(messages, resolved.preserveRecentMessages, resolved.truncateHeadChars, resolved.pages.inputPage)
+  const inputs = resolved.pages.page
+    ? pageLongInputs(messages, resolved.preserveRecentMessages, resolved.truncateHeadChars, resolved.pages.page)
     : { messages: [...messages], paged: 0, charsSaved: 0 };
-  const kept = applyDecisions(
-    writers.messages,
+  const rebuild = () => applyDecisions(
+    inputs.messages,
     decisions,
     calls,
     resolved.truncateHeadChars,
     dropAssistantTextIndices,
     resolved.pages,
   );
+  const thresholded = rebuild();
+  const pagedForTarget = collapseForTarget(messages, thresholded, calls, decisions, answers, resolved);
+  const kept = pagedForTarget > 0 ? rebuild() : thresholded;
   return {
     reviewedToolUseIds: toolCandidates.filter((call) => answers.has(call.id)).map((call) => call.tool_use_id),
     messages: kept,
     decisions,
     assistantTextDecisions,
     stats: {
-      inputsPaged: writers.paged,
+      inputsPaged: inputs.paged,
       pagedForTarget,
-      inputCharsSaved: writers.charsSaved,
+      inputCharsSaved: inputs.charsSaved,
       messagesBefore: messages.length,
       messagesAfter: kept.length,
       charsBefore,

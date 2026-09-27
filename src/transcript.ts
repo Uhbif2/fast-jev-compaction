@@ -1,4 +1,4 @@
-import { estimateTokens } from './state.js';
+import { claudeTokens } from './size.js';
 import type { Message, ToolResult, ToolUse } from './types.js';
 
 /**
@@ -274,21 +274,21 @@ function joinText(a: string, b: string): string {
 }
 
 /**
- * Tokens of what a message list shows the model, by the Jev estimator: text,
- * tool inputs and results (an inline outcome only where no result row
- * exists). It misses the system prompt, tool schemas, attachments and
- * thinking, so it measures a change, not the context itself.
+ * Claude tokens of what a message list shows the model: text, tool inputs
+ * and results (an inline outcome only where no result row exists). It misses
+ * the system prompt, tool schemas, attachments and thinking, so it measures a
+ * change, not the context itself.
  */
 export function visibleTokens(messages: readonly Message[]): number {
   const explicit = new Set(messages.flatMap((m) => m.toolResults ?? []).map((r) => r.tool_use_id));
   let tokens = 0;
   for (const message of messages) {
-    tokens += estimateTokens(message.text);
+    tokens += claudeTokens(message.text);
     for (const tool of message.toolUses) {
-      tokens += estimateTokens(JSON.stringify(tool.input) ?? '');
-      if (!explicit.has(tool.tool_use_id) && tool.text !== undefined) tokens += estimateTokens(tool.text);
+      tokens += claudeTokens(JSON.stringify(tool.input) ?? '');
+      if (!explicit.has(tool.tool_use_id) && tool.text !== undefined) tokens += claudeTokens(tool.text);
     }
-    for (const result of message.toolResults ?? []) tokens += estimateTokens(result.text);
+    for (const result of message.toolResults ?? []) tokens += claudeTokens(result.text);
   }
   return tokens;
 }

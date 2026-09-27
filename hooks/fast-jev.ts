@@ -11,7 +11,8 @@ import type {
 import { assistantTextCandidateIndices, compact, compactionCandidates, reductionRatio, resolveOptions } from '../src/compact.js';
 import { collectToolCalls, goalFromMessages } from '../src/state.js';
 import { buildJevRequest, DEFAULT_MODEL, parseJevResponse } from '../src/request.js';
-import { writerInputCandidates } from '../src/inputs.js';
+import { callPage, longInputCalls } from '../src/inputs.js';
+import { THINKING_TOKENS_PER_BLOCK } from '../src/size.js';
 import {
   dedupeReplayedHistory,
   dropCommandNoise,
@@ -33,6 +34,7 @@ import type {
   CompactResult,
   JevAsker,
   Message,
+  ToolCall,
 } from '../src/types.js';
 
 const HOOK_DEFAULTS = {
@@ -71,7 +73,7 @@ const timerDeadline: DeadlineWait = (ms) => {
   return { expired, cancel: () => clearTimeout(timer) };
 };
 
-export const LOCAL_BUILD = '0.3.0-local.15';
+export const LOCAL_BUILD = '0.3.0-local.16';
 
 export const JEV_MAX_ATTEMPTS = 6;
 const JEV_RETRY_DELAYS_MS = [1_000, 2_000, 4_000, 8_000, 15_000];
@@ -304,27 +306,36 @@ function percent(ratio: number): string {
 /** What Jev decided, in counts; sizes are reported separately, in tokens. */
 export function summarize(result: CompactResult): string {
   const { stats } = result;
+  const asked = new Set(result.reviewedToolUseIds);
+  const kept = result.decisions.filter((d) => d.reason === 'kept' && d.tool_use_id !== undefined && asked.has(d.tool_use_id)).length;
   const parts = [
     stats.resultsDropped > 0 ? `${stats.resultsDropped} result(s) truncated` : '',
     stats.callsDropped > 0 ? `${stats.callsDropped} call(s) dropped` : '',
-    stats.asked > 0 ? `${stats.asked - stats.resultsDropped - stats.callsDropped - stats.pagedForTarget} kept` : '',
+    stats.asked > 0 ? `${kept} kept` : '',
     stats.deferred > 0 ? `${stats.deferred} left for the next pass` : '',
-    stats.pagedForTarget > 0 ? `${stats.pagedForTarget} more paged out to reach the size target` : '',
     stats.assistantTextsDropped > 0 ? `${stats.assistantTextsDropped} assistant text(s) dropped` : '',
   ].filter(Boolean);
-  const inputs = stats.inputsPaged > 0 ? `; ${stats.inputsPaged} old Write/Edit input(s) paged out` : '';
-  if (stats.asked + stats.deferred === 0) return `no Jev request needed${inputs}`;
+  const paging = [
+    stats.inputsPaged > 0 ? `${stats.inputsPaged} old call input(s) paged out` : '',
+    // Any old call may be collapsed, not only those Jev was asked about.
+    stats.pagedForTarget > 0 ? `${stats.pagedForTarget} old call(s) collapsed to reach the size target` : '',
+  ].filter(Boolean).map((part) => `; ${part}`).join('');
+  if (stats.asked + stats.deferred === 0) return `no Jev request needed${paging}`;
   return `Jev checked ${stats.asked} of ${stats.asked + stats.deferred} candidate(s)${
     parts.length > 0 ? ': ' + parts.join(', ') : ''
-  } in ${stats.requests} request(s)${inputs}`;
+  } in ${stats.requests} request(s)${paging}`;
 }
 
+/** What Claude Code's own line after a compaction is, so it is not taken for the size. */
+const ENGINE_FIGURE_NOTE =
+  'Claude Code\'s own "saved N tokens" line is characters/4 of the messages without the system prompt and tools, not the size';
+
 /**
- * The size report. `before` is the real context of the last request; the cut
- * is what left the visible messages. Thinking blocks of old steps leave too
- * but their size is not visible to a plugin, so the result is an upper bound
- * and the next request gives the exact figure. The engine's own "compacted
- * to" number counts message content only and is not comparable with either.
+ * The size report, in Claude tokens. `before` is the real context of the
+ * last request; what left is the visible messages' cut plus the thinking of
+ * old steps, whose text a plugin does not see and which is estimated per
+ * block. Checked on 26.09: this predicted 309k where the next request carried
+ * 316.7k with a new prompt in it; Claude Code's own figure said 139k.
  */
 export function sizeReport(
   before: number | undefined,
@@ -334,18 +345,18 @@ export function sizeReport(
   reloaded = false,
 ): string {
   const cut = Math.max(0, visibleBefore - visibleAfter);
-  const thinking = thinkingRows > 0 ? ` and ${thinkingRows} thinking block(s) of unknown size` : '';
-  if (before === undefined) return `−${tokensText(cut)} tokens of messages${thinking}`;
+  const thinking = thinkingRows * THINKING_TOKENS_PER_BLOCK;
+  const thinkingText = thinkingRows > 0 ? `, ≈−${tokensText(thinking)} of ${thinkingRows} thinking block(s)` : '';
+  if (before === undefined) return `≈−${tokensText(cut + thinking)} tokens (−${tokensText(cut)} of messages${thinkingText})`;
   // The last request was measured before a reload doubled the history: that
   // figure says nothing about the context now, the messages themselves do.
   if (reloaded || visibleBefore > before) {
-    return `messages ~${tokensText(visibleBefore)} → ~${tokensText(visibleAfter)} tokens` +
-      (thinkingRows > 0 ? `, plus ${thinkingRows} thinking block(s) of unknown size dropped ` : ' ') +
-      `(the last measured context, ${tokensText(before)}, predates the reload that doubled the history; the next request shows the exact size)`;
+    return `messages ≈${tokensText(visibleBefore)} → ≈${tokensText(visibleAfter)} tokens${thinkingText} ` +
+      `(the last measured context, ${tokensText(before)}, predates the reload that doubled the history; the next reply shows the exact size)`;
   }
-  const after = Math.max(0, before - cut);
-  return `context ${tokensText(before)} → ${thinkingRows > 0 ? 'under ' : '~'}${tokensText(after)} tokens ` +
-    `(−${tokensText(cut)} of messages${thinking}; the next request shows the exact size)`;
+  const after = Math.max(0, before - cut - thinking);
+  return `context ${tokensText(before)} → ≈${tokensText(after)} tokens ` +
+    `(−${tokensText(cut)} of messages${thinkingText}; the next reply shows the exact size. ${ENGINE_FIGURE_NOTE})`;
 }
 
 const UI_LOG_MAX_CHARS = 4096;
@@ -490,7 +501,7 @@ export function transcriptPathFor(config: string, cwd: string, sessionId: string
   return `${config}/projects/${cwd.replace(/[^a-zA-Z0-9]/g, '-')}/${sessionId}.jsonl`;
 }
 
-/** Page files: the full text of each shortened result, one file per tool_use_id. */
+/** Page files: `<session id, 8 chars>/<tool_use_id>.call.txt`, one per old call, with its input and result. */
 export const PAGES_DIR = 'fast-jev-pages';
 /** $.fs rejects over 4 MiB; UTF-8 takes up to 3 bytes a character. */
 const PAGE_MAX_CHARS = 1_300_000;
@@ -511,31 +522,57 @@ function resultTextsOf(messages: readonly Message[]): Map<string, string> {
 }
 
 type PageTarget = {
-  fs: { write: (path: string, text: string) => Promise<void> };
+  fs: {
+    write: (path: string, text: string) => Promise<void>;
+    list: (path?: string) => Promise<Array<{ name: string }>>;
+  };
 };
 
+/** Below this many characters of input and result a call is not worth a page. */
+const PAGE_MIN_CHARS = 500;
+
 /**
- * Writes the page of every candidate before Jev decides, so that a note can
- * name a page only when it exists. A candidate Jev keeps costs one small file.
+ * Writes the page of every old call before Jev decides, so that a note names
+ * a page only when it exists. A page is never rewritten: a later compaction
+ * sees the call already shortened, and the first page is the whole one.
+ * Returns the ids that have a page.
  */
-export async function writePages(
+export async function writeCallPages(
   $: PageTarget,
   dir: string,
-  texts: ReadonlyMap<string, string>,
-  ids: readonly string[],
+  messages: readonly Message[],
+  calls: readonly Pick<ToolCall, 'tool_use_id' | 'resultChars' | 'input'>[],
 ): Promise<Set<string>> {
-  const written = new Set<string>();
-  for (const id of ids) {
-    const text = texts.get(id);
-    if (text === undefined || text.length > PAGE_MAX_CHARS || !/^[A-Za-z0-9_-]+(\.input)?$/.test(id)) continue;
+  let existing = new Set<string>();
+  try {
+    existing = new Set((await $.fs.list(dir)).map((entry) => entry.name));
+  } catch {
+    // No directory yet (or no listing): every page is written.
+  }
+  const results = resultTextsOf(messages);
+  const tools = new Map(messages.flatMap((m) => m.toolUses).map((tool) => [tool.tool_use_id, tool]));
+  const paged = new Set<string>();
+  for (const call of calls) {
+    const id = call.tool_use_id;
+    const name = `${id}.call.txt`;
+    if (!/^[A-Za-z0-9_-]+$/.test(id) || JSON.stringify(call.input).length + call.resultChars < PAGE_MIN_CHARS) continue;
+    if (existing.has(name)) {
+      paged.add(id);
+      continue;
+    }
+    const tool = tools.get(id);
+    const text = results.get(id);
+    if (!tool || text === undefined) continue;
+    const page = callPage(tool, { text, isError: tool.isError ?? false });
+    if (page.length > PAGE_MAX_CHARS) continue;
     try {
-      await $.fs.write(`${dir}/${id}.txt`, text);
-      written.add(id);
+      await $.fs.write(`${dir}/${name}`, page);
+      paged.add(id);
     } catch {
-      // The note then names the transcript instead.
+      // Without a page the call stays; a truncated result names the transcript.
     }
   }
-  return written;
+  return paged;
 }
 
 /** Origins of a message a person wrote: typed, from the phone bridge, the Desktop (SDK host), Slack. */
@@ -652,15 +689,18 @@ export const register: Register = (on: On, options: PluginOptions) => {
       const assistantEligible = resolvedPreflight.compactAssistantText
         ? assistantTextCandidateIndices(input, resolvedPreflight.preserveRecentMessages).length
         : 0;
-      const writers = sessionId
-        ? writerInputCandidates(input, resolvedPreflight.preserveRecentMessages, resolvedPreflight.truncateHeadChars)
-        : [];
-      const structural = repairs.length > 0 || thinkingRows > 0 || writers.length > 0;
-      if (eligible === 0 && assistantEligible === 0 && !structural) {
+      // Every old call can be paged out whole for the size target; one with a
+      // long input has it paged out in any case.
+      const oldCalls = sessionId ? preflightCalls.filter((call) => !call.pinned) : [];
+      const longInputs = sessionId
+        ? longInputCalls(input, resolvedPreflight.preserveRecentMessages, resolvedPreflight.truncateHeadChars).length
+        : 0;
+      const structural = repairs.length > 0 || thinkingRows > 0 || longInputs > 0;
+      if (eligible === 0 && assistantEligible === 0 && !structural && oldCalls.length === 0) {
         return await skipWith(
           $,
           gate,
-          `${tag}: nothing eligible (${pinned} pinned of ${preflightCalls.length} tool call(s), no thinking, old Write/Edit input or duplicates to drop); session unchanged, no Jev request`,
+          `${tag}: nothing eligible (${pinned} pinned of ${preflightCalls.length} tool call(s), no thinking, old call or duplicates to drop); session unchanged, no Jev request`,
         );
       }
 
@@ -670,14 +710,12 @@ export const register: Register = (on: On, options: PluginOptions) => {
         try {
           const root = await configDir($);
           pagesRoot = `${root}/${PAGES_DIR}`;
-          const dir = `${pagesRoot}/${sessionId}`;
-          const candidates = compactionCandidates(preflightCalls, resolvedPreflight).map((call) => call.tool_use_id);
-          const written = await writePages($, dir, resultTextsOf(input), candidates);
-          const inputTexts = new Map(writers.map((w) => [`${w.tool_use_id}.input`, w.page]));
-          const inputsWritten = await writePages($, dir, inputTexts, [...inputTexts.keys()]);
+          // The directory is the session id's first 8 characters: every note
+          // names its page, and a shorter path is paid once per note.
+          const dir = `${pagesRoot}/${sessionId.slice(0, 8)}`;
+          const paged = await writeCallPages($, dir, input, oldCalls);
           pages = {
-            page: (id) => (written.has(id) ? `${dir}/${id}.txt` : undefined),
-            inputPage: (id) => (inputsWritten.has(`${id}.input`) ? `${dir}/${id}.input.txt` : undefined),
+            page: (id) => (paged.has(id) ? `${dir}/${id}.call.txt` : undefined),
             transcript: transcriptPathFor(root, await $.session.cwd(), sessionId),
           };
         } catch (error) {
@@ -693,8 +731,19 @@ export const register: Register = (on: On, options: PluginOptions) => {
           tokensBefore = context.tokens;
           window = context.window;
         } catch {
-          // Only the size report needs it.
+          // Only the size report and the target need it.
         }
+      }
+      // The target, in Claude tokens of messages: what the context is over
+      // it, less what leaves anyway (old thinking, duplicates, command noise).
+      // After a reload that doubled the history the last measurement is
+      // stale; the messages themselves are the measure then.
+      const reloaded = deduped.toolCalls + deduped.texts > 0;
+      const measured = reloaded ? visibleTokens(event.messages) : tokensBefore;
+      let cutTokens = 0;
+      if (measured !== undefined && window && configured.targetPercent > 0) {
+        const leaving = thinkingRows * THINKING_TOKENS_PER_BLOCK + Math.max(0, visibleTokens(event.messages) - visibleTokens(input));
+        cutTokens = Math.max(0, measured - Math.floor((window * configured.targetPercent) / 100) - leaving);
       }
       const started = Date.now();
       let result: CompactResult | undefined;
@@ -714,12 +763,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
         };
         const goal = compactionGoal(input, configured, event.instructions);
         if (goal) config.goal = goal;
-        // The target counts from the last measured context; after a reload
-        // that doubled the history the messages themselves are the measure.
-        const measured = deduped.toolCalls + deduped.texts > 0 ? visibleTokens(event.messages) : tokensBefore;
-        if (measured !== undefined && window && configured.targetPercent > 0) {
-          config.cutTokens = Math.max(0, measured - Math.floor((window * configured.targetPercent) / 100));
-        }
+        config.cutTokens = cutTokens;
         if (pages) config.pages = pages;
         const compaction = await compactSession(
           input,
@@ -756,10 +800,14 @@ export const register: Register = (on: On, options: PluginOptions) => {
           );
         }
       } else {
-        // Nothing for Jev: only the deterministic part (old writer inputs) runs.
+        // Nothing for Jev: only the deterministic part (old inputs) and the
+        // size target run.
         const noJev: JevAsker = { ask: async () => { throw new Error('no Jev question expected'); } };
-        result = await compact(input, noJev, { ...configured, ...(pages ? { pages } : {}) });
+        result = await compact(input, noJev, { ...configured, cutTokens, ...(pages ? { pages } : {}) });
         rebuilt = toSessionMessages(result.messages);
+        if (result.stats.charsAfter >= result.stats.charsBefore && !structural) {
+          return await skipWith($, gate, `${tag}: nothing to take out (${pinned} pinned of ${preflightCalls.length} tool call(s), the context is within the size target); session unchanged`);
+        }
       }
 
       const visibleBefore = visibleTokens(event.messages);
@@ -774,7 +822,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
         $,
         gate,
         `${tag}: done in ${Math.round((Date.now() - started) / 1000)} s, no summary; ` +
-          `${sizeReport(tokensBefore, visibleBefore, visibleAfter, rebuilt.thinkingRows, deduped.toolCalls + deduped.texts > 0)}. ${parts.join('; ')}` +
+          `${sizeReport(tokensBefore, visibleBefore, visibleAfter, rebuilt.thinkingRows, reloaded)}. ${parts.join('; ')}` +
           (result ? `; ${transportSummary(transport)}` : ''),
       );
       if (sessionId && (restoring.restored.length > 0 || restoring.present.length > 0)) {
@@ -782,7 +830,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
       }
       if (main && event.trigger !== 'precompute') pageIns = 0;
       if (tokensBefore !== undefined && event.trigger !== 'precompute') {
-        effectPending = deduped.toolCalls + deduped.texts > 0 ? {} : { before: tokensBefore };
+        effectPending = reloaded ? {} : { before: tokensBefore };
         // Manual compaction also starts the auto-compaction cooldown.
         lastAutoTokens = tokensBefore;
       }

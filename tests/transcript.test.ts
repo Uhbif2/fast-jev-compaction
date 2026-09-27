@@ -10,7 +10,7 @@ import {
   visibleTokens,
   type EngineMessage,
 } from '../src/transcript.js';
-import { estimateTokens } from '../src/state.js';
+import { claudeTokens } from '../src/size.js';
 
 function user(text: string, handle?: string): EngineMessage {
   return { role: 'user', text, toolUses: [], ...(handle ? { handle } : {}) };
@@ -132,7 +132,7 @@ describe('measures', () => {
     const input = [user('task', 'u0'), assistant(''), assistant('', [['t1', 'Read', 'abc']]), results([['t1', 'abc']])];
     expect(thinkingOnlyRows(input)).toBe(1);
     // An inline outcome with a result row is not counted twice.
-    expect(visibleTokens(input)).toBe(estimateTokens('task') + estimateTokens('{"id":"t1"}') + estimateTokens('abc'));
+    expect(visibleTokens(input)).toBe(claudeTokens('task') + claudeTokens('{"id":"t1"}') + claudeTokens('abc'));
   });
 });
 

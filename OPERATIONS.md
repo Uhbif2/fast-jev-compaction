@@ -117,25 +117,33 @@ claude plugin validate .claude-plugin/plugin.json
 Toast'ы плагина начинаются с `fast-jev <LOCAL_BUILD> [<trigger>]` (`manual` — `/compact`,
 `plugin` — автокомпакция плагина). Отказ и no-op приходят одной строкой причины.
 
-Итог состоявшейся компакции (с local.14):
+Итог состоявшейся компакции (с local.16; числа для примера формата):
 
 ```text
-fast-jev 0.3.0-local.14 [manual]: done in 2 s, no summary; context 378k → under 334k tokens
-(−44k of messages and 78 thinking block(s) of unknown size; the next request shows the exact size).
-Jev checked 55 of 55 candidate(s): 27 result(s) truncated, 4 call(s) dropped, 24 kept in 2 request(s); …
+fast-jev 0.3.0-local.16 [manual]: done in 9 s, no summary; context 400k → ≈150k tokens
+(−230k of messages, ≈−20k of 41 thinking block(s); the next reply shows the exact size.
+Claude Code's own "saved N tokens" line is characters/4 …, not the size). Jev checked 55 of 55
+candidate(s): 3 result(s) truncated, 50 kept in 2 request(s); 77 old call input(s) paged out;
+207 old call(s) collapsed to reach the size target; 0 page-in(s) since the last compaction; …
 ```
 
-- `context U → under A` — U реальный размер последнего запроса, A верхняя граница после: из U
-  вычтено то, что ушло из видимых сообщений; thinking уходит тоже, но плагину его размер не виден;
-- `messages ~X → ~Y` вместо этого — сессия была переоткрыта с задвоенной историей, и последний
+- `context U → ≈A` — U реальный размер последнего запроса, A оценка после, в токенах Claude
+  (2.03 символа на токен, thinking ≈480 на блок; `src/size.ts`). Точно — следующий ответ;
+- строка движка «Compacted … saved N tokens» и счётчик контекста Desktop до следующего ответа
+  показывают `postTokens` движка: символы / 4 без системного промпта и инструментов, примерно
+  половина правды. На неё не смотреть;
+- `messages ≈X → ≈Y` вместо этого — сессия была переоткрыта с задвоенной историей, и последний
   замер устарел; рядом стоит `N duplicated call(s) removed`;
-- `no Jev request needed` — сократились только thinking, дубли и старые входы Write/Edit,
-  кандидатов для Jev не было;
-- `N more paged out to reach the size target` — выгружено сверх порога ради `targetPercent`;
+- `no Jev request needed` — кандидатов для Jev не было, работали только выгрузка входов,
+  сворачивание до цели, thinking и дубли;
+- `N old call input(s) paged out` — длинные поля старых входов (Bash, Write, Edit, …) выгружены;
+- `N old call(s) collapsed to reach the size target` — столько старых вызовов свёрнуто до строки
+  со страницей ради `targetPercent`;
 - `N page-in(s) since the last compaction` — сколько раз модель читала страницы после прошлой
   компакции. Много — выгрузка слишком смелая: поднять `targetPercent`.
 
-Страницы лежат в `~/.claude/fast-jev-pages/<session>/`; это данные сессии, удалять их можно вместе
+Страницы лежат в `~/.claude/fast-jev-pages/<первые 8 символов сессии>/<tool_use_id>.call.txt`
+(до local.16 — `<сессия>/<id>.txt` и `<id>.input.txt`); это данные сессии, удалять их можно вместе
 с сессией. Блокировки встроенного саммари — `~/.claude/fast-jev-guard.log`.
 
 **Эффект проверять по следующему запросу, а не по boundary.** После компакции, которая
@@ -150,6 +158,9 @@ carried N tokens (before: M; −D, −P%, …)». Это `usage` реально�
   схем инструментов, вложений и thinking; `preTokens` — реальный размер. Их разность завышает
   эффект в разы (26.09: «204k → 71k», фактически 200k → 164k). Хук её не переопределяет;
 - `preTokens` может означать только хвост после предыдущего boundary;
+- после компакции хуком Desktop показывает переписку заново под разделителем: копий на экране
+  столько, сколько было компакций, плюс одна. Это отображение, не контекст (см. CONTEXT.md,
+  local.16);
 - до local.8 хук при ошибке возвращал исходные сообщения, а boundary всё равно писался
   (21.09: «541k → 219k», а следующий запрос — 544k).
 
@@ -160,6 +171,13 @@ carried N tokens (before: M; −D, −P%, …)». Это `usage` реально�
 
 ```text
 npx tsx scripts/verify-transcript.ts <session.jsonl>
+```
+
+Из чего состоит контекст после компакции и что оставила бы текущая версия (без сети, размеры в
+токенах Claude, `--before N` — состояние перед N-й границей):
+
+```text
+npx tsx scripts/composition.ts <session.jsonl> [--before N] [opt:targetPercent=20]
 ```
 
 Чисто, когда `linksIntoHistory`, `sharedMessageIds`, `recoveredOnReload` и дубли равны 0, а
