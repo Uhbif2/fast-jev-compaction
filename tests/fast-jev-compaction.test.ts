@@ -622,4 +622,11 @@ last line`;
     const text = collapsedResultText('Bash', earlier, false, 'P/u9.call.txt');
     expect(text.startsWith('[fast-jev-compaction paged out this Bash call (input and 5600 chars of output): P/u9.call.txt]\nfirst line')).toBe(true);
   });
+
+  it('keeps no head for a tool whose output the disk still holds, unless it failed', () => {
+    expect(collapsedResultText('Edit', 'The file src/a.ts has been updated successfully.', false, 'P/e.call.txt'))
+      .toBe('[fast-jev-compaction paged out this Edit call (input and 48 chars of output): P/e.call.txt]');
+    expect(collapsedResultText('Read', 'File has not been read yet', true, 'P/r.call.txt'))
+      .toMatch(/error output\): P\/r\.call\.txt\]\nFile has not been read yet$/);
+  });
 });

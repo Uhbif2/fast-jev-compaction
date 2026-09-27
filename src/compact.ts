@@ -489,6 +489,13 @@ export function truncatedResultText(
 const COLLAPSED_HEAD_CHARS = 100;
 
 /**
+ * Tools whose output the files on disk still hold: a collapsed call of theirs
+ * keeps no head (a file's first line, "The file … has been updated"), unless
+ * it failed.
+ */
+const DISK_TOOLS = new Set(['Read', 'Edit', 'MultiEdit', 'Write', 'NotebookEdit', 'Grep', 'Glob', 'LS']);
+
+/**
  * What a collapsed call's result becomes: one note naming the call's page and
  * the first characters of the output. For a result an earlier compaction had
  * shortened, the size is the original's, read from that earlier note, and
@@ -497,9 +504,11 @@ const COLLAPSED_HEAD_CHARS = 100;
 export function collapsedResultText(tool: string, text: string, isError: boolean, page: string): string {
   const size = Number(/truncated \d+ of (\d+) chars/.exec(text)?.[1] ?? text.length);
   const flat = text.replace(/\s+/g, ' ').trim();
-  const head = flat.length > COLLAPSED_HEAD_CHARS ? `${flat.slice(0, COLLAPSED_HEAD_CHARS)}…` : flat;
+  const head = DISK_TOOLS.has(tool) && !isError ? ''
+    : flat.length > COLLAPSED_HEAD_CHARS ? `${flat.slice(0, COLLAPSED_HEAD_CHARS)}…` : flat;
   const note = `${COLLAPSED_NOTE}${tool} call (input and ${size} chars of ${isError ? 'error ' : ''}output): ${page}]`;
-  return head ? `${note}\n${head}` : note;
+  return head ? `${note}
+${head}` : note;
 }
 
 /** Below this many characters a collapse is not worth the note it costs. */

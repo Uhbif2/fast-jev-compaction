@@ -245,6 +245,40 @@ ${messages[1]!.toolUses[0]!.text}`);
     expect(toasts.at(-1)).toMatch(/1 old call\(s\) collapsed to reach the size target/);
   });
 
+  it('measures what the context carries besides the messages, and aims the next target with it', async () => {
+    let context = { tokens: 400_000, percent: 40, window: 1_000_000 };
+    const { handlers, $, toasts, stored } = engine({ fetch: jevAnswer(0.99), context: () => context });
+    await handlers['session.compact']!($, { trigger: 'manual', messages: bashTranscript() }, nextNeverCalled);
+    // Thinking and the engine's own additions leave the 400k far from the
+    // messages: only the next request says how much the rest is.
+    // Measured at the first tool call: the turn's end would count all it added.
+    context = { tokens: 160_000, percent: 16, window: 1_000_000 };
+    await handlers['tool.call']!($, { tool: 'Bash', command: 'ls' }, async () => ({ result: 'x' }));
+    context = { tokens: 290_000, percent: 29, window: 1_000_000 };
+    await handlers['turn.complete']!($, { turnId: 't' }, async () => ({ text: 'answer' }));
+    expect(stored.get('after-compaction-overhead')).toHaveLength(1);
+    const [overhead] = stored.get('after-compaction-overhead') as number[];
+    expect(overhead).toBeGreaterThan(155_000);
+    expect(overhead).toBeLessThan(160_000);
+    expect(toasts.find((t) => t.includes('first request after compaction carried 160k'))).toMatch(/outside the kept messages/);
+
+    // Over the 15% target already (≈158k): every old call is collapsed, and the
+    // report predicts from the measured overhead, not from 400k.
+    context = { tokens: 400_000, percent: 40, window: 1_000_000 };
+    const result = await handlers['session.compact']!($, { trigger: 'manual', messages: bashTranscript() }, nextNeverCalled);
+    const text = result.messages.flatMap((m: SessionMessage) => m.toolResults ?? []).find((r: { tool_use_id: string }) => r.tool_use_id === 't1').text;
+    expect(text).toMatch(/^\[fast-jev-compaction paged out this Bash call/);
+    expect(toasts.at(-1)).toMatch(/context 400k → ≈16\dk tokens \(messages ≈/);
+  });
+
+  it('leaves the messages alone when the measured overhead leaves room under the target', async () => {
+    const { handlers, $, stored } = engine({ fetch: jevAnswer(0.99), context: () => ({ tokens: 400_000, percent: 40, window: 1_000_000 }) });
+    stored.set('after-compaction-overhead', [60_000]);
+    const result = await handlers['session.compact']!($, { trigger: 'manual', messages: bashTranscript() }, nextNeverCalled);
+    const texts = (result.messages ?? []).flatMap((m: SessionMessage) => (m.toolResults ?? []).map((r) => r.text));
+    expect(texts.some((t: string) => t.startsWith('[fast-jev-compaction paged out'))).toBe(false);
+  });
+
   it('names the transcript when a page cannot be written', async () => {
     const { handlers, $ } = engine({ fetch: jevAnswer(0.001), failWrites: true });
     const result = await handlers['session.compact']!($, { trigger: 'manual', messages: bashTranscript() }, nextNeverCalled);
