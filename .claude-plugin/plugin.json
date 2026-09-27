@@ -1,6 +1,6 @@
 {
   "name": "fast-jev-compaction-local",
-  "version": "0.3.0-local.17",
+  "version": "0.3.0-local.18",
   "description": "Local hardened fast-jev compaction: Jev-only (never a Claude summary), conservative tool relevance scoring, result previews, sharded dialogue context, bounded retries.",
   "license": "MIT",
   "userConfig": {
@@ -28,11 +28,23 @@
       "description": "Context percentage at which turn.complete requests compaction.",
       "default": 60
     },
-    "targetPercent": {
+    "ceilingPercent": {
       "type": "number",
-      "title": "Target after compaction",
-      "description": "Context percentage a compaction aims for, in real tokens: old tool calls are collapsed to one line naming their page (input and output stay one file read away), least needed per token by Jev's order first, until it is reached. 0 uses the keep threshold alone.",
-      "default": 15
+      "title": "Ceiling after compaction",
+      "description": "The most a compaction may leave, as a context percentage in real tokens. What stays is decided by content: every old tool call Jev does not keep is collapsed to one line naming its page. Only past this ceiling are kept calls collapsed too. 0: two thirds of the compaction percentage.",
+      "default": 0
+    },
+    "keepAbove": {
+      "type": "number",
+      "title": "Keep score (keep-or-page question)",
+      "description": "With the keep-or-page question: an old tool call stays whole when Jev's score is at least this; every other old call is collapsed to one line naming its page, which the model reads back when needed. Measured 27.09: 0.4 keeps about a quarter of old output and 1.6x more of what is needed soon than a random choice of that size.",
+      "default": 0.4
+    },
+    "questionVariant": {
+      "type": "string",
+      "title": "Jev question",
+      "description": "keep_or_page (default): stay in context or is the page enough. relevance: the older question (is the information still needed), scored no better than random on 27.09 for paging.",
+      "default": "keep_or_page"
     },
     "minReductionRatio": {
       "type": "number",

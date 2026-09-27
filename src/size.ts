@@ -1,5 +1,5 @@
 /**
- * Sizes in Claude's tokens, for the size target and the size report. The Jev
+ * Sizes in Claude's tokens, for the ceiling and the size report. The Jev
  * estimator in state.ts is calibrated for Jev's own limits and is the wrong
  * scale here: on real Opus 5.5 requests it counts code and logs 1.3 times
  * too low and Cyrillic text 1.5 times too high. Claude Code's own

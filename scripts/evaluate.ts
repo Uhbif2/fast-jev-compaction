@@ -65,7 +65,11 @@ export type CandidateOutcome = {
   firstUseAfter?: number;
 };
 
-export function evaluateCut(prefix: readonly Message[], future: readonly Message[], headChars = 300): CandidateOutcome[] {
+/**
+ * `labelHead`: characters at each end a removal keeps. 300 (a truncation keeps
+ * head and tail) by default; 0 for a collapse, which keeps none of the output.
+ */
+export function evaluateCut(prefix: readonly Message[], future: readonly Message[], headChars = 300, labelHead = headChars): CandidateOutcome[] {
   const options = resolveOptions({ preserveRecentMessages: 12, truncateHeadChars: headChars });
   const calls = collectToolCalls(prefix, options.preserveRecentMessages);
   const candidates = compactionCandidates(calls, options);
@@ -79,12 +83,12 @@ export function evaluateCut(prefix: readonly Message[], future: readonly Message
   }
   for (const call of calls) {
     const text = resultText(prefix, call);
-    if (!candidateIds.has(call.tool_use_id) || text.length <= headChars * 2 + 200) {
+    if (!candidateIds.has(call.tool_use_id) || text.length <= labelHead * 2 + 200) {
       count(distinctiveTokens(text));
       continue;
     }
-    count(distinctiveTokens(text.slice(0, headChars) + '\n' + text.slice(-headChars)));
-    bodies.set(call.tool_use_id, distinctiveTokens(text.slice(headChars, -headChars)));
+    if (labelHead > 0) count(distinctiveTokens(text.slice(0, labelHead) + '\n' + text.slice(-labelHead)));
+    bodies.set(call.tool_use_id, distinctiveTokens(text.slice(labelHead, text.length - labelHead)));
   }
   // A body value counts only when nothing else at the cut holds it; two
   // bodies sharing it make each of them look replaceable, which it is not.

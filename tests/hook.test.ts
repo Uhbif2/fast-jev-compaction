@@ -53,7 +53,7 @@ function jevFetch(answer: (name: string) => number, bodies: string[] = []) {
 
 describe('hook config', () => {
   it('reads userConfig values and falls back to defaults', () => {
-    expect(resolveHookConfig({})).toEqual({ compactAtPercent: 60, targetPercent: 15, minReductionRatio: 0, compactAssistantText: false, model: 'jev-latest' });
+    expect(resolveHookConfig({})).toEqual({ compactAtPercent: 60, ceilingPercent: 0, questionVariant: 'keep_or_page', minReductionRatio: 0, compactAssistantText: false, model: 'jev-latest' });
     expect(
       resolveHookConfig({ apiKey: 'k', keepThreshold: 0.3, maxStateTokens: 1000, model: 'jev-x', goal: 'g', compactAtPercent: 'no' }),
     ).toEqual({
@@ -63,7 +63,8 @@ describe('hook config', () => {
       model: 'jev-x',
       goal: 'g',
       compactAtPercent: 60,
-      targetPercent: 15,
+      ceilingPercent: 0,
+      questionVariant: 'keep_or_page',
       minReductionRatio: 0,
       compactAssistantText: false,
     });
@@ -103,7 +104,7 @@ describe('compactSession', () => {
       call('inline-bash', 'Bash', { command: 'npm test' }, output),
       message('user', 'The shell output is historical now.', { handle: 'h-inline-2' }),
     ];
-    const config = { ...resolveHookConfig({ preserveRecentMessages: 0, compactAssistantText: false }), apiKey: 'k' };
+    const config = { ...resolveHookConfig({ preserveRecentMessages: 0, compactAssistantText: false, questionVariant: 'relevance' }), apiKey: 'k' };
     const { result: compacted, messages: after } = await compactSession(messages, config, jevFetch(() => 0.1));
 
     expect(compacted.decisions[0]?.action).toBe('drop_result');
@@ -117,7 +118,7 @@ describe('compactSession', () => {
 
   it('runs the library over the engine fetch and reports the outcome', async () => {
     const bodies: string[] = [];
-    const config = { ...resolveHookConfig({ preserveRecentMessages: 1, compactAssistantText: false }), apiKey: 'k', model: 'jev-x' };
+    const config = { ...resolveHookConfig({ preserveRecentMessages: 1, compactAssistantText: false, questionVariant: 'relevance' }), apiKey: 'k', model: 'jev-x' };
     const { result: output, messages } = await compactSession(
       transcript(),
       config,
@@ -134,7 +135,7 @@ describe('compactSession', () => {
   });
 
   it('splits a long decision log into ui.log lines under the host limit', async () => {
-    const config = { ...resolveHookConfig({ preserveRecentMessages: 1, compactAssistantText: false }), apiKey: 'k' };
+    const config = { ...resolveHookConfig({ preserveRecentMessages: 1, compactAssistantText: false, questionVariant: 'relevance' }), apiKey: 'k' };
     const { result: output } = await compactSession(transcript(), config, jevFetch(() => 0.1));
     const lines = decisionLogLines(output, 70);
     expect(lines).toEqual([

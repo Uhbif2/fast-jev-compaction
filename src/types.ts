@@ -77,7 +77,7 @@ export interface CallDecision extends CallAnswer {
   tool_use_id?: string;
   tool: string;
   action: CallAction;
-  reason: 'pinned' | 'kept' | 'result_dropped' | 'call_dropped' | 'paged_for_target';
+  reason: 'pinned' | 'kept' | 'result_dropped' | 'call_dropped' | 'paged_out' | 'paged_for_target';
 }
 
 export interface AssistantTextDecision {
@@ -147,6 +147,13 @@ export interface CompactOptions {
   truncateHeadChars?: number;
   /** Characters from each end of a tool result shown to Jev while scoring it. Default 1000. */
   resultPreviewChars?: number;
+  /** What Jev is asked: `relevance` (default) or `keep_or_page`. */
+  questionVariant?: 'relevance' | 'keep_or_page';
+  /**
+   * With `keep_or_page`: an old call stays whole when Jev scores it at least
+   * this; every other old call is collapsed to one line naming its page.
+   */
+  keepAbove?: number;
   /** Also score old assistant text for relevance; user text is never removed. Default false. */
   compactAssistantText?: boolean;
   /**
@@ -181,6 +188,8 @@ export interface ResolvedCompactOptions {
   maxRequestTokens: number;
   truncateHeadChars: number;
   resultPreviewChars: number;
+  questionVariant: 'relevance' | 'keep_or_page';
+  keepAbove: number;
   compactAssistantText: boolean;
   pages: NonNullable<CompactOptions['pages']>;
   cutTokens: number;
@@ -196,6 +205,8 @@ export interface CompactResult {
   stats: {
     /** Old calls whose long input fields were paged out, and the characters that took out. */
     inputsPaged: number;
+    /** Old calls collapsed because Jev did not keep them (`keep_or_page`). */
+    pagedOut: number;
     /** Calls collapsed to reach cutTokens. */
     pagedForTarget: number;
     inputCharsSaved: number;

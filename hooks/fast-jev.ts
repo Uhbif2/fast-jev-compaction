@@ -39,7 +39,8 @@ import type {
 
 const HOOK_DEFAULTS = {
   compactAtPercent: 60,
-  targetPercent: 15,
+  ceilingPercent: 0,
+  questionVariant: 'keep_or_page' as const,
   minReductionRatio: 0,
   compactAssistantText: false,
   model: DEFAULT_MODEL,
@@ -73,7 +74,7 @@ const timerDeadline: DeadlineWait = (ms) => {
   return { expired, cancel: () => clearTimeout(timer) };
 };
 
-export const LOCAL_BUILD = '0.3.0-local.17';
+export const LOCAL_BUILD = '0.3.0-local.18';
 
 export const JEV_MAX_ATTEMPTS = 6;
 const JEV_RETRY_DELAYS_MS = [1_000, 2_000, 4_000, 8_000, 15_000];
@@ -119,8 +120,12 @@ export function retryAfterMs(headers: Record<string, string> | undefined, now = 
 export type HookConfig = CompactOptions & {
   apiKey?: string;
   compactAtPercent: number;
-  /** A compaction aims to bring the context to this share of the window; 0 turns the target off. */
-  targetPercent: number;
+  /**
+   * The most a compaction may leave, as a share of the window: past it more
+   * old calls are collapsed. 0: two thirds of `compactAtPercent`, so an
+   * auto-compaction is never followed by another one at once.
+   */
+  ceilingPercent: number;
   minReductionRatio: number;
   model: string;
 };
@@ -146,6 +151,7 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
     'truncateHeadChars',
     'resultPreviewChars',
     'maxJevRequests',
+    'keepAbove',
   ] as const) {
     const value = options[key];
     if (typeof value === 'number' && Number.isFinite(value)) numbers[key] = value;
@@ -153,7 +159,8 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
   const config: HookConfig = {
     ...numbers,
     compactAtPercent: optionNumber(options, 'compactAtPercent', HOOK_DEFAULTS.compactAtPercent),
-    targetPercent: optionNumber(options, 'targetPercent', HOOK_DEFAULTS.targetPercent),
+    ceilingPercent: optionNumber(options, 'ceilingPercent', HOOK_DEFAULTS.ceilingPercent),
+    questionVariant: options['questionVariant'] === 'relevance' ? 'relevance' : HOOK_DEFAULTS.questionVariant,
     minReductionRatio: optionNumber(
       options,
       'minReductionRatio',
@@ -318,7 +325,8 @@ export function summarize(result: CompactResult): string {
   const paging = [
     stats.inputsPaged > 0 ? `${stats.inputsPaged} old call input(s) paged out` : '',
     // Any old call may be collapsed, not only those Jev was asked about.
-    stats.pagedForTarget > 0 ? `${stats.pagedForTarget} old call(s) collapsed to reach the size target` : '',
+    stats.pagedOut > 0 ? `${stats.pagedOut} old call(s) Jev did not keep collapsed to their pages` : '',
+    stats.pagedForTarget > 0 ? `${stats.pagedForTarget} more collapsed to stay under the ceiling` : '',
   ].filter(Boolean).map((part) => `; ${part}`).join('');
   if (stats.asked + stats.deferred === 0) return `no Jev request needed${paging}`;
   return `Jev checked ${stats.asked} of ${stats.asked + stats.deferred} candidate(s)${
@@ -624,7 +632,7 @@ type Effect = { before?: number; visibleAfter: number };
 
 /**
  * The real size of the first request after a compaction, and what of it lay
- * outside the kept messages, stored for the next size target.
+ * outside the kept messages, stored for the next ceiling.
  */
 async function reportEffect($: NotifyTarget & StoreTarget, gate: ToastGate, effect: Effect, tokens: number): Promise<void> {
   const { before, visibleAfter } = effect;
@@ -638,7 +646,7 @@ async function reportEffect($: NotifyTarget & StoreTarget, gate: ToastGate, effe
       (before === undefined
         ? ' (the size before it was not measured after the reload)'
         : ` (before: ${tokensText(before)}; ${saved > 0 ? `−${tokensText(saved)}, −${percent(saved / before)}` : 'no reduction'}, the new prompt included)`) +
-      (overhead > 0 ? `; ≈${tokensText(overhead)} of it is outside the kept messages (system prompt, tools, listings, CLAUDE.md, attachments, the new prompt), which the next size target counts on` : ''),
+      (overhead > 0 ? `; ≈${tokensText(overhead)} of it is outside the kept messages (system prompt, tools, listings, CLAUDE.md, attachments, the new prompt), which the next ceiling counts on` : ''),
   );
 }
 const QUEUED_PER_SESSION = 50;
@@ -753,7 +761,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
       const assistantEligible = resolvedPreflight.compactAssistantText
         ? assistantTextCandidateIndices(input, resolvedPreflight.preserveRecentMessages).length
         : 0;
-      // Every old call can be paged out whole for the size target; one with a
+      // Every old call can be paged out whole; one with a
       // long input has it paged out in any case.
       const oldCalls = sessionId ? preflightCalls.filter((call) => !call.pinned) : [];
       const longInputs = sessionId
@@ -808,8 +816,11 @@ export const register: Register = (on: On, options: PluginOptions) => {
       const measured = reloaded ? visibleTokens(event.messages) : tokensBefore;
       const overhead = main ? await measuredOverhead($) : undefined;
       let cutTokens = 0;
-      if (window && configured.targetPercent > 0) {
-        const target = Math.floor((window * configured.targetPercent) / 100);
+      const ceilingPercent = configured.ceilingPercent > 0
+        ? configured.ceilingPercent
+        : (configured.compactAtPercent * 2) / 3;
+      if (window && ceilingPercent > 0) {
+        const target = Math.floor((window * ceilingPercent) / 100);
         if (overhead !== undefined) {
           cutTokens = Math.max(0, visibleTokens(input) - Math.max(0, target - overhead));
         } else if (measured !== undefined) {
@@ -873,12 +884,12 @@ export const register: Register = (on: On, options: PluginOptions) => {
         }
       } else {
         // Nothing for Jev: only the deterministic part (old inputs) and the
-        // size target run.
+        // collapsing of old calls run.
         const noJev: JevAsker = { ask: async () => { throw new Error('no Jev question expected'); } };
         result = await compact(input, noJev, { ...configured, cutTokens, ...(pages ? { pages } : {}) });
         rebuilt = toSessionMessages(result.messages);
         if (result.stats.charsAfter >= result.stats.charsBefore && !structural) {
-          return await skipWith($, gate, `${tag}: nothing to take out (${pinned} pinned of ${preflightCalls.length} tool call(s), the context is within the size target); session unchanged`);
+          return await skipWith($, gate, `${tag}: nothing to take out (${pinned} pinned of ${preflightCalls.length} tool call(s), nothing old worth collapsing); session unchanged`);
         }
       }
 
