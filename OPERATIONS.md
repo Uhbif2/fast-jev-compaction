@@ -249,3 +249,17 @@ Claude. `--source` меняет identity на inline-plugin и потому мо
 5. Проверить build marker в новом Code runtime.
 
 Upstream 0.3.0 установлен отдельно и disabled; это reference/fallback, а не рабочий источник local fork.
+
+## Публичный форк
+
+`https://github.com/Uhbif2/fast-jev-compaction`, ветка `local` (по умолчанию; `main` — зеркало
+upstream). Здесь это ветка `public` → remote `fork`. История `public` переписана от `master`:
+корень привит к upstream `e3f262a`, автор — GitHub noreply, из всех коммитов убраны `CLAUDE.md` и
+`docs/review-2026-09-22.md`, локальные пути в `*.md` заменены на `<repo>`/`<local folder>`.
+Поэтому `master` туда не пушится, общей истории у них нет.
+
+Выпуск новой версии в форк: `git switch public`, `git cherry-pick <последний опубликованный>..master`
+(коммиты, трогающие `CLAUDE.md`, — `git rm CLAUDE.md` и `--continue`), перед push —
+`git grep -n -E 'C:[\/](MCPs|Users)|пульт|stack\.json' public` и `git log -p <old>..public`
+на пути, почту и секреты; затем `git push fork public:local`. Последний опубликованный — версия в
+сообщении верхнего коммита `public`.
