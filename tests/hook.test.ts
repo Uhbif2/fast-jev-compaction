@@ -3,6 +3,7 @@ import {
   compactSession,
   decisionLog,
   decisionLogLines,
+  jevEndpoint,
   resolveHookConfig,
   summarize,
   toSessionMessages,
@@ -53,7 +54,7 @@ function jevFetch(answer: (name: string) => number, bodies: string[] = []) {
 
 describe('hook config', () => {
   it('reads userConfig values and falls back to defaults', () => {
-    expect(resolveHookConfig({})).toEqual({ compactAtPercent: 60, ceilingPercent: 0, questionVariant: 'keep_or_page', minReductionRatio: 0, compactAssistantText: false, model: 'jev-latest' });
+    expect(resolveHookConfig({})).toEqual({ compactAtPercent: 60, ceilingPercent: 0, questionVariant: 'keep_or_page', minReductionRatio: 0, compactAssistantText: false, model: 'jev-latest', provider: 'openrouter' });
     expect(
       resolveHookConfig({ apiKey: 'k', keepThreshold: 0.3, maxStateTokens: 1000, model: 'jev-x', goal: 'g', compactAtPercent: 'no' }),
     ).toEqual({
@@ -67,7 +68,16 @@ describe('hook config', () => {
       questionVariant: 'keep_or_page',
       minReductionRatio: 0,
       compactAssistantText: false,
+      provider: 'openrouter',
     });
+  });
+
+  it('picks the Jev endpoint by provider', () => {
+    expect(jevEndpoint(resolveHookConfig({}))).toBe('https://openrouter.ai/api/v1/systemone');
+    expect(jevEndpoint(resolveHookConfig({ provider: 'typesafe' }))).toBe('https://api.typesafe.ai/v1/systemone');
+    expect(jevEndpoint(resolveHookConfig({ baseUrl: 'http://x/y' }))).toBe('http://x/y');
+    expect(resolveHookConfig({ provider: 'nope' }).provider).toBe('openrouter');
+    expect(resolveHookConfig({ openrouterApiKey: 'o', apiKey: 't' })).toMatchObject({ openrouterApiKey: 'o', apiKey: 't' });
   });
 });
 

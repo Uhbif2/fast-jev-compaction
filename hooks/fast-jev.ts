@@ -10,7 +10,7 @@ import type {
 
 import { assistantTextCandidateIndices, compact, compactionCandidates, reductionRatio, resolveOptions } from '../src/compact.js';
 import { collectToolCalls, goalFromMessages } from '../src/state.js';
-import { buildJevRequest, DEFAULT_MODEL, parseJevResponse } from '../src/request.js';
+import { buildJevRequest, DEFAULT_MODEL, OPENROUTER_SYSTEM_ONE_URL, parseJevResponse, SYSTEM_ONE_URL } from '../src/request.js';
 import { callPage, longInputCalls } from '../src/inputs.js';
 import { THINKING_TOKENS_PER_BLOCK } from '../src/size.js';
 import {
@@ -74,7 +74,7 @@ const timerDeadline: DeadlineWait = (ms) => {
   return { expired, cancel: () => clearTimeout(timer) };
 };
 
-export const LOCAL_BUILD = '0.3.0-local.18';
+export const LOCAL_BUILD = '0.3.0-local.19';
 
 export const JEV_MAX_ATTEMPTS = 6;
 const JEV_RETRY_DELAYS_MS = [1_000, 2_000, 4_000, 8_000, 15_000];
@@ -117,8 +117,17 @@ export function retryAfterMs(headers: Record<string, string> | undefined, now = 
   return Math.min(ms, JEV_MAX_RETRY_AFTER_MS);
 }
 
+export type JevProvider = 'openrouter' | 'typesafe';
+
 export type HookConfig = CompactOptions & {
+  /** TypeSafe key (`provider=typesafe`), or the resolved key of the chosen provider inside `compactSession`. */
   apiKey?: string;
+  /** OpenRouter key (`provider=openrouter`). */
+  openrouterApiKey?: string;
+  /** Where Jev is called; OpenRouter by default (the TypeSafe account ran out of credit, 12.10.2026). */
+  provider: JevProvider;
+  /** Endpoint override; the provider's System One URL when absent. */
+  baseUrl?: string;
   compactAtPercent: number;
   /**
    * The most a compaction may leave, as a share of the window: past it more
@@ -167,6 +176,7 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
       HOOK_DEFAULTS.minReductionRatio,
     ),
     model: optionString(options, 'model') ?? HOOK_DEFAULTS.model,
+    provider: options['provider'] === 'typesafe' ? 'typesafe' : 'openrouter',
   };
   const compactAssistantText = options['compactAssistantText'];
   config.compactAssistantText =
@@ -175,6 +185,10 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
       : HOOK_DEFAULTS.compactAssistantText;
   const apiKey = optionString(options, 'apiKey');
   if (apiKey) config.apiKey = apiKey;
+  const openrouterApiKey = optionString(options, 'openrouterApiKey');
+  if (openrouterApiKey) config.openrouterApiKey = openrouterApiKey;
+  const baseUrl = optionString(options, 'baseUrl');
+  if (baseUrl) config.baseUrl = baseUrl;
   const goal = optionString(options, 'goal');
   if (goal) config.goal = goal;
   return config;
@@ -194,12 +208,13 @@ export function jevAsker(
   sleep: HookSleep = timerSleep,
   budgetMs: number = JEV_TOTAL_BUDGET_MS,
   deadlineWait: DeadlineWait = timerDeadline,
+  baseUrl?: string,
 ): JevAsker {
   let batchNumber = 0;
   const deadline = Date.now() + budgetMs;
   return {
     async ask(state, questions) {
-      const request = buildJevRequest({ apiKey, model }, state, questions);
+      const request = buildJevRequest({ apiKey, model, baseUrl }, state, questions);
       const batch = ++batchNumber;
       transport.batches += 1;
 
@@ -288,8 +303,8 @@ export async function compactSession(
   observer: CompactObserver = {},
   deadlineWait: DeadlineWait = timerDeadline,
 ): Promise<SessionCompaction> {
-  if (!config.apiKey) throw new Error('TYPESAFE_API_KEY is not configured');
-  const asker = jevAsker(fetchFn, config.apiKey, config.model, log, transport, sleep, JEV_TOTAL_BUDGET_MS, deadlineWait);
+  if (!config.apiKey) throw new Error('Jev API key is not configured (OPENROUTER_API_KEY or TYPESAFE_API_KEY, see provider)');
+  const asker = jevAsker(fetchFn, config.apiKey, config.model, log, transport, sleep, JEV_TOTAL_BUDGET_MS, deadlineWait, config.baseUrl);
   const result = await compact(messages as readonly Message[], asker, config, observer);
   const rebuild = toSessionMessages(result.messages);
   return { result, messages: rebuild.messages, rebuild };
@@ -412,17 +427,25 @@ export function decisionLogLines(
 }
 
 /**
- * The key comes from the sensitive `apiKey` option (Claude Code keeps it in
- * its secure storage). TYPESAFE_API_KEY in the process environment is only a
- * fallback; settings.json is deliberately not read: a key there is plain text
- * that every child process inherits.
+ * The key comes from the sensitive option of the chosen provider
+ * (`openrouterApiKey` / `apiKey`; Claude Code keeps them in its secure
+ * storage). OPENROUTER_API_KEY / TYPESAFE_API_KEY in the process environment
+ * are only a fallback; settings.json is deliberately not read: a key there is
+ * plain text that every child process inherits.
  */
 async function getApiKey(
   $: { env: { get: (name: string) => Promise<string | undefined> } },
   config: HookConfig,
 ): Promise<string | undefined> {
-  if (config.apiKey) return config.apiKey;
-  return (await $.env.get('TYPESAFE_API_KEY')) || undefined;
+  if (config.provider === 'typesafe') {
+    return config.apiKey || (await $.env.get('TYPESAFE_API_KEY')) || undefined;
+  }
+  return config.openrouterApiKey || (await $.env.get('OPENROUTER_API_KEY')) || undefined;
+}
+
+/** The System One endpoint of the chosen provider unless `baseUrl` overrides it. */
+export function jevEndpoint(config: Pick<HookConfig, 'provider' | 'baseUrl'>): string {
+  return config.baseUrl ?? (config.provider === 'typesafe' ? SYSTEM_ONE_URL : OPENROUTER_SYSTEM_ONE_URL);
 }
 
 type NotifyTarget = {
@@ -843,6 +866,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
           ...configured,
           recentlyReviewedToolUseIds: [...reviewedToolUseIds],
           apiKey: await getApiKey($, configured),
+          baseUrl: jevEndpoint(configured),
         };
         const goal = compactionGoal(input, configured, event.instructions);
         if (goal) config.goal = goal;

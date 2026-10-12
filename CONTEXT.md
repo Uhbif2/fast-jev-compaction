@@ -1,13 +1,13 @@
 # Durable context — fast-jev-compaction-local
 
-Обновлено: 27.09.2026.
+Обновлено: 12.10.2026.
 
 ## Идентичность
 
 - Upstream: tamaratran/fast-jev-compaction 0.3.0.
 - Local plugin: fast-jev-compaction-local@fast-jev-compaction-local.
 - Upstream установлен отдельно и disabled.
-- Текущий local release: 0.3.0-local.18.
+- Текущий local release: 0.3.0-local.19.
 - Единственный рабочий исходник: `C:\MCPs\fast-jev-compaction-local` (свой git с 22.09.2026;
   базовая точка — тег `v0.3.0-local.7`). Local marketplace указывает сюда.
 
@@ -71,6 +71,21 @@ model=jev-latest
 maxJevRequests=16
 
 `targetPercent` в local.18 убран; в профиле владельца его не было и нет.
+
+## Изменения local.19 (12.10): Jev через OpenRouter
+
+На ключе TypeSafe (console.typesafe.ai) кончились деньги (HTTP 402 `billing_error`). OpenRouter
+отдаёт ту же System One: `POST https://openrouter.ai/api/v1/systemone`, тот же запрос и ответ,
+`jev-latest` маппится на `~typesafe/jev-latest` (док: openrouter.ai/docs/guides/community/typesafe-sdk).
+Проверено 12.10 одним запросом: 200, `noul` в ответе, ≈$0.00001 за запрос; ответ называет
+`typesafe/jev-1.13`.
+
+- Опция `provider`: `openrouter` (по умолчанию) или `typesafe`. Ключ OpenRouter — отдельная
+  sensitive-опция `openrouterApiKey` (запасной путь — `OPENROUTER_API_KEY` в окружении); ключ
+  TypeSafe `apiKey` не тронут, вернуться можно сменой `provider`. `baseUrl` — необязательная
+  подмена адреса.
+- Сам алгоритм не менялся: вопросы, оценки и пороги те же, оценки Jev идентичны.
+- Побочное: судья памяти graphiti тоже на кредитах TypeSafe (402), откатывается на косинусный гейт.
 
 ## Изменения local.18 (27.09): сколько оставить, решает содержимое; вопрос Jev сменён
 

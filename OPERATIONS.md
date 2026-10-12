@@ -27,6 +27,7 @@ Local marketplace в `~/.claude/settings.json` (`extraKnownMarketplaces`) и
 | `maxRequestTokens` | default `62000` |
 | `resultPreviewChars` | default `1000` |
 | `truncateHeadChars` | default `300` |
+| `provider` | default `openrouter` (с local.19; `typesafe` — прежний api.typesafe.ai) |
 | `model` | `jev-latest` |
 | `maxJevRequests` | default `16` |
 
@@ -108,7 +109,7 @@ claude plugin validate .claude-plugin/plugin.json
 - upstream `fast-jev-compaction@fast-jev-compaction` остаётся disabled rollback-reference;
 - установленный cache содержит ожидаемый `LOCAL_BUILD`;
 - `compactAssistantText=false`;
-- TypeSafe key только проверяется на наличие, его значение не выводится;
+- ключ провайдера (`openrouterApiKey` / `apiKey` или `OPENROUTER_API_KEY` / `TYPESAFE_API_KEY` в окружении) только проверяется на наличие, значение не выводится;
 - no-op `/compact` при 0 eligible candidates должен завершаться почти мгновенно и не обращаться к Jev;
 - при Jev error, no-op и малом сокращении хук отвечает `{ skip }`: сессия неизменна, boundary
   не пишется, Claude summary не запускается;

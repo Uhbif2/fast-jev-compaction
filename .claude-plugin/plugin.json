@@ -1,12 +1,24 @@
 {
   "name": "fast-jev-compaction-local",
-  "version": "0.3.0-local.18",
+  "version": "0.3.0-local.19",
   "description": "Local hardened fast-jev compaction: Jev-only (never a Claude summary), conservative tool relevance scoring, result previews, sharded dialogue context, bounded retries.",
   "license": "MIT",
   "userConfig": {
+    "provider": {
+      "type": "string",
+      "title": "Jev provider",
+      "description": "openrouter (default): Jev through OpenRouter, billed to the OpenRouter account, key in openrouterApiKey. typesafe: api.typesafe.ai, key in apiKey.",
+      "default": "openrouter"
+    },
+    "openrouterApiKey": {
+      "type": "string",
+      "title": "OpenRouter API key",
+      "description": "OpenRouter API key for provider=openrouter, kept in Claude Code secure storage. Falls back to OPENROUTER_API_KEY in the environment; not read from settings.json.",
+      "sensitive": true
+    },
     "apiKey": {
       "type": "string",
-      "title": "TypeSafe API key",
+      "title": "TypeSafe API key (provider=typesafe)",
       "description": "TypeSafe API key, kept in Claude Code secure storage. Falls back to TYPESAFE_API_KEY in the environment; not read from settings.json.",
       "sensitive": true
     },
@@ -93,6 +105,11 @@
       "title": "Compact old assistant text",
       "description": "Optional experimental scoring/removal of old assistant text. Disabled by default. When false, all user and assistant text is preserved verbatim and only tool calls/results are compacted.",
       "default": false
+    },
+    "baseUrl": {
+      "type": "string",
+      "title": "System One endpoint",
+      "description": "Overrides the provider endpoint (https://openrouter.ai/api/v1/systemone or https://api.typesafe.ai/v1/systemone). Leave empty."
     }
   }
 }

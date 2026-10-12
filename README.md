@@ -50,5 +50,5 @@ claude plugin validate .claude-plugin/plugin.json
 
 ## Sensitive configuration
 
-Runtime credential для TypeSafe передаётся через окружение или sensitive plugin option. Его
+Runtime credential (OpenRouter по умолчанию, `provider=typesafe` — TypeSafe) передаётся через окружение или sensitive plugin option (`openrouterApiKey` / `apiKey`). Его
 значение не хранится в repository, docs, logs или fixtures.
