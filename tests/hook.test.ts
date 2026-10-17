@@ -5,6 +5,7 @@ import {
   decisionLogLines,
   jevEndpoint,
   resolveHookConfig,
+  sizeReport,
   summarize,
   toSessionMessages,
 } from '../hooks/fast-jev.ts';
@@ -53,6 +54,15 @@ function jevFetch(answer: (name: string) => number, bodies: string[] = []) {
 }
 
 describe('hook config', () => {
+  it('separates the plugin estimate from observed usage and the engine-owned Desktop figure', () => {
+    const report = sizeReport(400_000, 20_000, 10_000, 1, false);
+    expect(report).toContain('plugin estimate');
+    expect(report).toContain('last-request observed engine usage');
+    expect(report).toContain('first-request input usage pending');
+    expect(report).toContain('engine-owned');
+    expect(report).toContain('not controlled by the plugin');
+  });
+
   it('reads userConfig values and falls back to defaults', () => {
     expect(resolveHookConfig({})).toEqual({ compactAtPercent: 60, ceilingPercent: 0, questionVariant: 'keep_or_page', minReductionRatio: 0, compactAssistantText: false, model: 'jev-latest', provider: 'openrouter' });
     expect(

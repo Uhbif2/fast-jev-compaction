@@ -24,3 +24,12 @@ acceptance:
 
 ## Передача
 TZ-703 скрещивает эти hook contract fixtures с provenance replay TZ-701; TZ-705 читает finalized LOCAL_BUILD из TZ-702, не правя hook.
+
+## Итог (W4037, claim_id 14278; 15.10.2026)
+
+- S1: `turn.complete` больше не инициирует `session.compact` или Jev ни при 30%, ни при 70%/95%; ручной `/compact` по-прежнему проходит через `session.compact` с Jev-only ответом или `{ skip }`, без `next(event)`/Claude summary. Contract fixtures — `tests/register.test.ts`.
+- S3: `sizeReport` явно маркирует plugin estimate, last-request usage и pending first-request; после первой post-compact engine usage выводится отдельно с provenance (`observed engine` или `synthetic/mock`). Desktop `saved N` назван engine-owned и неуправляемым плагином. `src/size.ts`, `hooks/fast-jev.ts`, `tests/hook.test.ts`.
+- Отказы 429/5xx сохраняют bounded retry/Retry-After и заканчиваются skip без изменений входной сессии и без built-in summary. Нуль eligible — no-op без Jev. При невозможности прочитать список страниц (кроме ENOENT) новые файлы не пишутся; существующие имена учитываются без регистра. Набранный текст владельца и assistant text не удаляются новой логикой.
+- Приёмка по коду: `npm run typecheck` rc=0; `npm test -- tests/register.test.ts tests/hook.test.ts` rc=0 (39/39); полный `npx vitest run` rc=0 (104/104 до дополнительного ENOENT-теста). `git diff --check` rc=0. Все обращения к Jev были mock/synthetic; реальных ключей, сети, профиля и настроек не касались.
+- Внешний `intent/scenarios.py:105` пока ищет старую формулировку toast (`first request after compaction carried`); W4040 уведомлен, исправление вне owns этой задачи. `LOCAL_BUILD=0.3.0-local.19` оставлен синхронизированным с тремя манифестами; выпуск версии и Desktop runtime здесь не проводились.
+- Соседняя TZ-701 параллельно добавила два новых provenance-теста (`tests/transcript.test.ts:104,115`): повторный полный `npx vitest run` после этих изменений rc=1 (105 PASS, 2 FAIL) — `dedupeReplayedHistory` удаляет самостоятельный assistant text. Это дефект `src/transcript.ts` вне owns TZ-702, факты направлены W4013; полный зелёный gate требуется повторить после его исправления.
