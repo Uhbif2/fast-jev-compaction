@@ -74,15 +74,26 @@ function engine(setup: {
         if (setup.failWrites) throw new Error('EACCES');
         written.set(path, text);
       },
+      list: async () => [] as { name: string }[],
     },
     settings: { read: async () => ({}) },
-    clock: { sleep: async () => {} },
+    clock: {
+      // Synthetic/mock clock: retry delays elapse instantly, but deadline
+      // sleeps stay pending until cancelled (unlike an immediate Promise).
+      sleep: async (_ms: number, options?: { signal?: AbortSignal }) => {
+        if (!options?.signal) return;
+        await new Promise<void>((resolve) => {
+          if (options.signal?.aborted) return resolve();
+          options.signal?.addEventListener('abort', () => resolve(), { once: true });
+        });
+      },
+    },
     http: { fetch: setup.fetch ?? jevAnswer(0.001) },
     session: {
       id: async () => 'session-1',
       cwd: async () => 'C:\\work\\proj',
       messages: async () => setup.sessionMessages ?? [],
-      usage: async () => ({ context: setup.context?.() ?? { window: 1_000_000 }, rateLimits: [] }),
+      usage: async () => ({ context: { ...(setup.context?.() ?? { window: 1_000_000 }), measurementSource: 'synthetic/mock' }, rateLimits: [] }),
       compact: async () => {
         order.push('compact');
         return (await setup.compact?.()) ?? { skip: 'nothing' };
@@ -144,10 +155,12 @@ describe('session.compact never hands over to the Claude summary', () => {
     const result = await handlers['session.compact']!($, { trigger: 'manual', messages }, nextNeverCalled);
     expect(result.messages).toBeDefined();
     expect(result.messages.some((m: SessionMessage) => m.handle === 'thinking')).toBe(false);
-    expect(toasts.at(-1)).toMatch(/context 400k → ≈\d+k tokens \(−\d+k? of messages, ≈−480 of 1 thinking block\(s\); the next reply shows the exact size\. Claude Code's own "saved N tokens" line is characters\/4/);
+    expect(toasts.at(-1)).toMatch(/plugin estimate: context 400k → ≈\d+k tokens \(−\d+k? of messages, ≈−480 of 1 thinking block\(s\); next request still unmeasured\)/);
+    expect(toasts.at(-1)).toContain('last-request synthetic/mock usage: 400k tokens');
+    expect(toasts.at(-1)).toContain('engine-owned Desktop "saved N tokens" line is not controlled by the plugin');
   });
 
-  it('heals a transcript an earlier compaction doubled, without asking Jev', async () => {
+  it('heals a proven replay without asking Jev and removes exactly one duplicated assistant text', async () => {
     let asked = 0;
     const { handlers, $, toasts } = engine({ fetch: async () => { asked += 1; return { status: 500, ok: false, text: '', headers: {} }; } });
     const once = [
@@ -156,13 +169,48 @@ describe('session.compact never hands over to the Claude summary', () => {
       message('user', '', { toolResults: [{ tool_use_id: 't1', text: 'short', isError: false }], handle: 'h2' }),
       message('assistant', 'a.ts is fine.', { handle: 'h3' }),
     ];
-    const doubled = [...once, ...once.slice(1).map((m) => ({ ...m, handle: `${m.handle}-copy` })), message('user', 'next', { handle: 'h9' })];
-    const result = await handlers['session.compact']!($, { trigger: 'manual', messages: doubled }, nextNeverCalled);
+    // The engine gave the text the SAME source handle on replay: text provenance is proven.
+    const replay = once.slice(1).map((m) => ({
+      ...m, handle: m.role === 'assistant' && m.text ? m.handle : `${m.handle}-copy`,
+    }));
+    const result = await handlers['session.compact']!($, {
+      trigger: 'manual', messages: [...once, ...replay, message('user', 'next', { handle: 'h9' })],
+    }, nextNeverCalled);
     expect(result.skip).toBeUndefined();
     expect(result.messages.flatMap((m: SessionMessage) => m.toolUses.map((t) => t.tool_use_id))).toEqual(['t1']);
-    expect(result.messages.filter((m: SessionMessage) => m.text === 'a.ts is fine.')).toHaveLength(1);
+    expect(result.messages.flatMap((m: SessionMessage) => (m.toolResults ?? []).map((r) => r.tool_use_id))).toEqual(['t1']);
+    expect(result.messages.filter((m: SessionMessage) => m.role === 'assistant' && m.text === 'a.ts is fine.')).toHaveLength(1);
+    expect(result.messages.filter((m: SessionMessage) => m.role === 'user' && m.text === 'Check a.ts.').map((m: SessionMessage) => m.handle)).toEqual(['h0']);
     expect(asked).toBe(0);
     expect(toasts.at(-1)).toMatch(/no Jev request needed; 0 page-in\(s\) since the last compaction; 1 duplicated call\(s\) removed; 1 duplicated text\(s\) removed/);
+  });
+
+  it('preserves both independent same-text assistant replies despite an adjacent tool replay', async () => {
+    let asked = 0;
+    const { handlers, $, toasts } = engine({ fetch: async () => { asked += 1; return { status: 500, ok: false, text: '', headers: {} }; } });
+    const once = [
+      message('user', 'Check a.ts.', { handle: 'h0' }),
+      message('assistant', '', { toolUses: [{ tool_use_id: 't1', tool: 'Read', input: { file_path: 'a.ts' }, text: 'short' }], handle: 'h1' }),
+      message('user', '', { toolResults: [{ tool_use_id: 't1', text: 'short', isError: false }], handle: 'h2' }),
+      message('assistant', 'a.ts is fine.', { handle: 'h3' }),
+    ];
+    // A different assistant source handle is NOT proof of text replay.
+    const independent = once.slice(1).map((m) => ({ ...m, handle: `${m.handle}-copy` }));
+    const result = await handlers['session.compact']!($, {
+      trigger: 'manual', messages: [...once, ...independent, message('user', 'next', { handle: 'h9' })],
+    }, nextNeverCalled);
+    expect(result.skip).toBeUndefined();
+    expect(result.messages.flatMap((m: SessionMessage) => m.toolUses.map((t) => t.tool_use_id))).toEqual(['t1']);
+    expect(result.messages.flatMap((m: SessionMessage) => (m.toolResults ?? []).map((r) => r.tool_use_id))).toEqual(['t1']);
+    // engineMessages joins adjacent assistant rows, but must not drop either source text.
+    expect(result.messages.filter((m: SessionMessage) => m.role === 'assistant' && m.text.includes('a.ts is fine.'))
+      .map((m: SessionMessage) => m.text)).toEqual(['a.ts is fine.\n\na.ts is fine.']);
+    expect(result.messages.filter((m: SessionMessage) => m.role === 'user' && m.text === 'Check a.ts.').map((m: SessionMessage) => m.handle)).toEqual(['h0']);
+    expect(result.messages.some((m: SessionMessage) => m.role === 'user' && m.text === 'next' && m.handle === 'h9')).toBe(true);
+    expect(asked).toBe(0);
+    expect(toasts.at(-1)).toMatch(/no Jev request needed; 0 page-in\(s\) since the last compaction; 1 duplicated call\(s\) removed/);
+    // Zero text removals are omitted from the toast rather than printed as a literal 0.
+    expect(Number(toasts.at(-1)?.match(/(\d+) duplicated text\(s\) removed/)?.[1] ?? '0')).toBe(0);
   });
 
   it('refuses while a call still waits for its result', async () => {
@@ -293,7 +341,7 @@ ${messages[1]!.toolUses[0]!.text}`);
     const [overhead] = stored.get('after-compaction-overhead') as number[];
     expect(overhead).toBeGreaterThan(155_000);
     expect(overhead).toBeLessThan(160_000);
-    expect(toasts.find((t) => t.includes('first request after compaction carried 160k'))).toMatch(/outside the kept messages/);
+    expect(toasts.find((t) => t.includes('first-request input usage [synthetic/mock] 160k'))).toMatch(/outside the kept messages/);
 
     // Over the 15% target already (≈158k): every old call is collapsed, and the
     // report predicts from the measured overhead, not from 400k.
@@ -319,6 +367,33 @@ ${messages[1]!.toolUses[0]!.text}`);
     expect(texts.some((t: string) => t.includes('the original is in C:/Users/me/.claude/projects/C--work-proj/session-1.jsonl'))).toBe(true);
   });
 
+  it('never writes a page when existing pages cannot be enumerated', async () => {
+    const { handlers, $, written } = engine({ fetch: jevAnswer(0.001) });
+    $.fs.list = async () => { throw new Error('EACCES'); };
+    const result = await handlers['session.compact']!($, { trigger: 'manual', messages: bashTranscript() }, nextNeverCalled);
+    expect(result.messages).toBeDefined();
+    expect(written.size).toBe(0);
+    const texts = result.messages.flatMap((m: SessionMessage) => (m.toolResults ?? []).map((r) => r.text));
+    expect(texts.some((t: string) => t.includes('the original is in C:/Users/me/.claude/projects/'))).toBe(true);
+  });
+
+  it('permits creating the first immutable page in an ENOENT directory', async () => {
+    const { handlers, $, written } = engine({ fetch: jevAnswer(0.001) });
+    $.fs.list = async () => { throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }); };
+    const result = await handlers['session.compact']!($, { trigger: 'manual', messages: bashTranscript() }, nextNeverCalled);
+    const page = 'C:/Users/me/.claude/fast-jev-pages/session-/t1.call.txt';
+    expect(result.messages).toBeDefined();
+    expect(written.get(page)).toContain('export const a = 1;');
+  });
+
+  it('treats existing page filenames case-insensitively (Windows immutable pages)', async () => {
+    const { handlers, $, written } = engine({ fetch: jevAnswer(0.001) });
+    $.fs.list = async () => [{ name: 'T1.CALL.TXT' }];
+    const result = await handlers['session.compact']!($, { trigger: 'manual', messages: bashTranscript() }, nextNeverCalled);
+    expect(result.messages).toBeDefined();
+    expect(written.size).toBe(0);
+  });
+
   it('never rejects, even when the UI throws', async () => {
     const { handlers, $ } = engine({
       fetch: async () => {
@@ -333,51 +408,54 @@ ${messages[1]!.toolUses[0]!.text}`);
   });
 });
 
-describe('auto-compaction from turn.complete', () => {
+describe('manual-only compaction contract', () => {
+  const nextNeverCalled = async () => { throw new Error('built-in Claude summary must never run'); };
   const next = (order: string[]) => async () => {
     order.push('next');
     return { text: 'answer' };
   };
 
-  it('compacts only after the turn is closed, above the threshold, on the main loop', async () => {
-    const main = engine({ context: () => ({ tokens: 400_000, percent: 40, window: 1_000_000 }) });
-    const answer = await main.handlers['turn.complete']!(main.$, { turnId: 't' }, next(main.order));
-    expect(answer).toEqual({ text: 'answer' });
-    expect(main.order).toEqual(['next', 'compact']);
-
-    const sub = engine({ context: () => ({ tokens: 400_000, percent: 40, window: 1_000_000 }) });
-    await sub.handlers['turn.complete']!(sub.$, { turnId: 't', agentId: 'a1' }, next(sub.order));
-    expect(sub.order).toEqual(['next']);
-
-    const low = engine({ context: () => ({ tokens: 200_000, percent: 20, window: 1_000_000 }) });
-    await low.handlers['turn.complete']!(low.$, { turnId: 't' }, next(low.order));
-    expect(low.order).toEqual(['next']);
-  });
-
-  it('waits for real growth before trying again', async () => {
-    let tokens = 400_000;
+  it.each([30, 70, 95])('at %i%% turn.complete makes zero compact or remote Jev calls', async (percent) => {
+    let remoteCalls = 0;
     const { handlers, $, order } = engine({
-      context: () => ({ tokens, percent: tokens / 10_000, window: 1_000_000 }),
+      context: () => ({ tokens: percent * 10_000, percent, window: 1_000_000 }),
+      fetch: async () => { remoteCalls += 1; throw new Error('remote Jev must not run'); },
+      compact: async () => { throw new Error('session.compact must not run'); },
     });
-    await handlers['turn.complete']!($, { turnId: '1' }, next(order));
-    tokens = 450_000;
-    await handlers['turn.complete']!($, { turnId: '2' }, next(order));
-    tokens = 510_000;
-    await handlers['turn.complete']!($, { turnId: '3' }, next(order));
-    expect(order.filter((o) => o === 'compact')).toHaveLength(2);
+    for (const agentId of [undefined, 'subagent']) {
+      await handlers['turn.complete']!($, { turnId: '1', agentId }, next(order));
+    }
+    expect(order).toEqual(['next', 'next']);
+    expect(remoteCalls).toBe(0);
   });
 
-  it('makes a failed auto-compaction visible once, then retries quietly', async () => {
-    const { handlers, $, order, toasts } = engine({
-      context: () => ({ tokens: 400_000, percent: 40, window: 1_000_000 }),
-      compact: async () => {
-        throw new Error('a turn is running');
-      },
+  it('allows one explicit manual /compact request without built-in fallback', async () => {
+    let remoteCalls = 0;
+    const { handlers, $, order } = engine({
+      context: () => ({ tokens: 700_000, percent: 70, window: 1_000_000 }),
+      fetch: async (url, init) => { remoteCalls += 1; return jevAnswer(0.001)(url, init); },
     });
     await handlers['turn.complete']!($, { turnId: '1' }, next(order));
-    await handlers['turn.complete']!($, { turnId: '2' }, next(order));
-    expect(order.filter((o) => o === 'compact')).toHaveLength(2);
-    expect(toasts.filter((t) => t.includes('auto-compact did not run'))).toHaveLength(1);
+    const manual = await handlers['session.compact']!($, { trigger: 'manual', messages: transcript() }, nextNeverCalled);
+    expect(manual.skip).toBeUndefined();
+    expect(manual.messages).toBeDefined();
+    expect(order).toEqual(['next']);
+    expect(remoteCalls).toBe(1);
+  });
+
+  it('keeps input intact and skips without Claude summary when Jev returns 503', async () => {
+    let remoteCalls = 0;
+    const original = transcript();
+    const { handlers, $, order } = engine({
+      fetch: async () => { remoteCalls += 1; return { status: 503, ok: false, text: 'down', headers: {} }; },
+    });
+    const failed = await handlers['session.compact']!($, { trigger: 'manual', messages: original }, nextNeverCalled);
+    expect(failed.skip).toMatch(/session unchanged, no Claude summary/);
+    expect(failed.messages).toBeUndefined();
+    expect(original[1]?.toolUses[0]?.text).toContain('export const a = 1;');
+    expect(remoteCalls).toBeGreaterThan(0);
+    expect(remoteCalls).toBeLessThanOrEqual(6);
+    expect(order).not.toContain('compact');
   });
 
   it('reports what the first request after a compaction really carried', async () => {
@@ -391,7 +469,7 @@ describe('auto-compaction from turn.complete', () => {
     expect(result.messages).toBeDefined();
     tokens = 180_000;
     await handlers['turn.complete']!($, { turnId: '2' }, next(order));
-    expect(toasts.at(-1)).toMatch(/first request after compaction carried 180k tokens \(before: 400k; −220k, −55%/);
+    expect(toasts.at(-1)).toMatch(/first-request input usage \[synthetic\/mock\] 180k tokens \(before: 400k; −220k, −55%/);
   });
 });
 

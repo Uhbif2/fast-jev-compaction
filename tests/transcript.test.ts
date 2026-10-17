@@ -93,13 +93,172 @@ describe('engineMessages', () => {
 });
 
 describe('dedupeReplayedHistory', () => {
+  it('keeps distinct assistant rows even when they reconstruct the text of an earlier joined row', () => {
+    const input = [
+      user('Start', 'u-independent'),
+      assistant('alpha\n\nbeta', [], 'a-combined'),
+      assistant('alpha', [], 'a-independent-1'),
+      assistant('beta', [], 'a-independent-2'),
+    ];
+    const out = dedupeReplayedHistory(input);
+    expect(out.messages).toEqual(input);
+    expect(out.texts).toBe(0);
+  });
+
+  it('does not delete identical legitimate assistant text without replay provenance', () => {
+    const input = [
+      user('Start', 'u-independent'),
+      assistant('Acknowledged.', [], 'a-independent-1'),
+      assistant('Acknowledged.', [], 'a-independent-2'),
+    ];
+    const out = dedupeReplayedHistory(input);
+    expect(out.messages).toEqual(input);
+    expect(out.texts).toBe(0);
+  });
+
+  it('preserves independent equal assistant replies despite an unrelated replayed tool ID', () => {
+    const first = assistant('Confirmed.', [], 'unique-assistant-1');
+    const second = assistant('Confirmed.', [], 'unique-assistant-2');
+    const call = assistant('', [['id1', 'Bash', 'synthetic output']], 'original-call');
+    const result = results([['id1', '[full output: C:/synthetic-pages/id1.call.txt]']]);
+    const replayCall = assistant('', [['id1', 'Bash', 'synthetic output']], 'replay-call');
+    const replayResult = results([['id1', '[full output: C:/synthetic-pages/id1.call.txt]']]);
+    const input = [user('Start', 'u1'), first, call, result, replayCall, replayResult, second];
+    const out = dedupeReplayedHistory(input);
+    expect(out.messages).toEqual([input[0], first, call, result, second]);
+    expect(out.toolCalls).toBe(1);
+    expect(out.texts).toBe(0);
+  });
+
+  it('keeps separate equal assistant replies immediately before a duplicate tool call', () => {
+    const first = assistant('Checking.', [], 'statement-first');
+    const second = assistant('Checking.', [], 'statement-independent');
+    const input = [
+      user('Start', 'u1'),
+      first,
+      assistant('', [['same-id', 'Read', 'output']], 'call-first'),
+      results([['same-id', '[full output: C:/synthetic-pages/same.call.txt]']], '', 'result-first'),
+      second,
+      assistant('', [['same-id', 'Read', 'output']], 'call-replay'),
+      results([['same-id', '[full output: C:/synthetic-pages/same.call.txt]']], '', 'result-replay'),
+    ];
+    const repaired = dedupeReplayedHistory(input);
+    expect(repaired.messages.filter((m) => m.role === 'assistant' && m.text === 'Checking.'))
+      .toEqual([first, second]);
+    expect(repaired.toolCalls).toBe(1);
+    expect(repaired.texts).toBe(0);
+  });
+
+  it('keeps separate equal assistant replies immediately after a duplicate tool result', () => {
+    const first = assistant('Done.', [], 'genuine-first');
+    const second = assistant('Done.', [], 'genuine-second');
+    const input = [
+      user('Start', 'u1'),
+      assistant('', [['same-id', 'Bash', 'output']], 'call-first'),
+      results([['same-id', '[full output: C:/synthetic-pages/same.call.txt]']], '', 'result-first'),
+      first,
+      assistant('', [['same-id', 'Bash', 'output']], 'call-replay'),
+      results([['same-id', '[full output: C:/synthetic-pages/same.call.txt]']], '', 'result-replay'),
+      second,
+    ];
+    const repaired = dedupeReplayedHistory(input);
+    expect(repaired.messages.filter((m) => m.role === 'assistant' && m.text === 'Done.'))
+      .toEqual([first, second]);
+    expect(engineMessages(repaired.messages).messages
+      .filter((m) => m.role === 'assistant' && m.text.includes('Done.'))
+      .map((m) => m.text)).toEqual(['Done.\n\nDone.']);
+    expect(repaired.toolCalls).toBe(1);
+    expect(repaired.texts).toBe(0);
+  });
+
+  it('does not erase aligned whole-text or split replies with different source identities', () => {
+    const sourceText = assistant('alpha\n\nbeta', [], 'source-whole');
+    const sourceA = assistant('alpha', [], 'source-alpha');
+    const sourceB = assistant('beta', [], 'source-beta');
+    const independentText = assistant('alpha\n\nbeta', [], 'independent-whole');
+    const independentA = assistant('alpha', [], 'independent-alpha');
+    const independentB = assistant('beta', [], 'independent-beta');
+    const input = [
+      user('Start', 'u1'),
+      assistant('', [['t1', 'Read', 'x']], 'call-original'),
+      results([['t1', '[full output: C:/synthetic-pages/t1.call.txt]']], '', 'result-original'),
+      sourceText, sourceA, sourceB,
+      assistant('', [['t1', 'Read', 'x']], 'call-replayed'),
+      results([['t1', '[full output: C:/synthetic-pages/t1.call.txt]']], '', 'result-replayed'),
+      independentText, independentA, independentB,
+    ];
+    const repaired = dedupeReplayedHistory(input);
+    expect(repaired.messages).toEqual([
+      input[0], input[1], input[2],
+      sourceText, sourceA, sourceB,
+      independentText, independentA, independentB,
+    ]);
+    expect(repaired.toolCalls).toBe(1);
+    expect(repaired.texts).toBe(0);
+  });
+
+  it('preserves identical aligned replies without any source handle', () => {
+    const first = { ...assistant('Ready.', [], 'old-handle'), handle: undefined };
+    const second = { ...assistant('Ready.', [], 'new-handle'), handle: undefined };
+    const input = [
+      user('Start', 'u1'),
+      assistant('', [['id', 'Read', 'data']], 'call-original'),
+      results([['id', '[full output: C:/synthetic-pages/id.call.txt]']]),
+      first,
+      assistant('', [['id', 'Read', 'data']], 'call-replayed'),
+      results([['id', '[full output: C:/synthetic-pages/id.call.txt]']]),
+      second,
+    ];
+    const repaired = dedupeReplayedHistory(input);
+    expect(repaired.messages.filter((m) => m.role === 'assistant' && m.text === 'Ready.'))
+      .toEqual([first, second]);
+    expect(repaired.texts).toBe(0);
+  });
+
+  it('preserves independently authored joined and split assistant prose around a tool replay', () => {
+    const original = assistant('Confirmed.\n\nReady.', [], 'unique-whole-1');
+    const following = assistant('Confirmed.\n\nReady.', [], 'unique-whole-2');
+    const firstFragment = assistant('Confirmed.', [], 'unique-fragment-1');
+    const secondFragment = assistant('Ready.', [], 'unique-fragment-2');
+    const call = assistant('', [['id1', 'Bash', 'synthetic output']], 'original-call');
+    const result = results([['id1', '[full output: C:/synthetic-pages/id1.call.txt]']]);
+    const replayCall = assistant('', [['id1', 'Bash', 'synthetic output']], 'replay-call');
+    const replayResult = results([['id1', '[full output: C:/synthetic-pages/id1.call.txt]']]);
+    const input = [
+      user('Start', 'u1'), original, call, result, replayCall, replayResult,
+      following, firstFragment, secondFragment,
+    ];
+    const out = dedupeReplayedHistory(input);
+    expect(out.messages).toEqual([
+      input[0], original, call, result, following, firstFragment, secondFragment,
+    ]);
+    expect(out.toolCalls).toBe(1);
+    expect(out.texts).toBe(0);
+  });
+
+  it('does not treat unrelated duplicated tool IDs as provenance for unique assistant fragments', () => {
+    const call = assistant('', [['same-tool', 'Bash', 'output']], 'first-call');
+    const seen = results([['same-tool', '[full output: C:/synthetic-pages/same.call.txt]']]);
+    const duplicateCall = assistant('', [['same-tool', 'Bash', 'output']], 'replayed-call');
+    const duplicateResult = results([['same-tool', '[full output: C:/synthetic-pages/same.call.txt]']]);
+    const joined = assistant('alpha\n\nbeta', [], 'unique-joined');
+    const first = assistant('alpha', [], 'unique-first');
+    const second = assistant('beta', [], 'unique-second');
+    const input = [user('Start', 'u1'), call, seen, duplicateCall, duplicateResult, joined, first, second];
+    const out = dedupeReplayedHistory(input);
+    expect(out.messages).toEqual([input[0], call, seen, joined, first, second]);
+    expect(out.toolCalls).toBe(1);
+    expect(out.texts).toBe(0);
+  });
+
   it('removes what a reload of a damaged transcript doubled, never user text', () => {
+    const original = assistant('Looking.');
     const input = [
       user('task', 'u0'),
-      assistant('Looking.'),
+      original,
       assistant('', [['t1', 'Read', 'A']]),
       results([['t1', 'A']]),
-      assistant('Looking.', [], 'copy-1'),
+      assistant('Looking.', [], original.handle),
       assistant('', [['t1', 'Read', 'A']], 'copy-2'),
       results([['t1', 'A']], '', 'copy-3'),
       user('task', 'u7'),
@@ -109,6 +268,85 @@ describe('dedupeReplayedHistory', () => {
     expect(out.toolCalls).toBe(1);
     expect(out.texts).toBe(1);
     expect(out.messages).toEqual([input[0], input[1], input[2], input[3], input[7], input[8]]);
+  });
+
+  it('recognizes a replay of complete assistant rows previously joined, without splitting original prose', () => {
+    const joined = assistant('skill_listing: old tools\n\ninstructions: old rules');
+    const call = assistant('', [['replayed-tool', 'Bash', 'synthetic output']], 'call-original');
+    const result = results([['replayed-tool', '[full output: C:/synthetic-pages/one.call.txt]']]);
+    const replayedCall = assistant('', [['replayed-tool', 'Bash', 'synthetic output']], 'call-replayed');
+    const replayedResult = results([['replayed-tool', '[full output: C:/synthetic-pages/one.call.txt]']]);
+    const originalUser = user('Keep these literal paragraphs:\n\nskill_listing: old tools', 'user-original');
+    const newUser = user('Keep these literal paragraphs:\n\nskill_listing: old tools', 'user-new-turn');
+    const repeated = [
+      originalUser,
+      call,
+      result,
+      joined,
+      replayedCall,
+      replayedResult,
+      assistant('skill_listing: old tools\n\ninstructions: old rules', [], joined.handle),
+      assistant('skill_listing: old tools', [], joined.handle),
+      assistant('instructions: old rules', [], joined.handle),
+      newUser,
+      assistant('skill_listing: old tools', [], 'legitimate-next-turn'),
+      assistant('a normal paragraph\n\nskill_listing: old tools\n\na final paragraph'),
+    ];
+    const out = dedupeReplayedHistory(repeated);
+    expect(out.messages).toEqual([originalUser, call, result, joined, newUser, repeated[10], repeated[11]]);
+    expect(out.texts).toBe(3);
+    expect(out.toolCalls).toBe(1);
+    expect(out.messages.filter((message) => message.role === 'user' && message.text.trim().length > 0))
+      .toEqual([originalUser, newUser]);
+    expect(out.messages[6]?.text).toContain('a normal paragraph\n\nskill_listing: old tools\n\na final paragraph');
+  });
+
+  it('does not drop an isolated matching paragraph or skip over a new tool call', () => {
+    const joined = assistant('first\n\nsecond');
+    const isolated = assistant('first');
+    const call = assistant('', [['new-call', 'Bash', 'actual result']]);
+    const final = assistant('second');
+    const input = [user('question'), joined, isolated, call, results([['new-call', 'actual result']]), final];
+    expect(dedupeReplayedHistory(input).messages).toEqual(input);
+  });
+
+  it('preserves a repeated tool ID in a new user turn and maps each page to its call', () => {
+    const call = (handle: string, file: string) => ({
+      ...assistant('', [['same-id', 'Read', file]], handle),
+      toolUses: [{ tool_use_id: 'same-id', tool: 'Read', input: { file_path: file } }],
+    });
+    const first = results([['same-id', '[full output: C:/pages/one.txt]']]);
+    const second = results([['same-id', '[full output: C:/pages/two.txt]']]);
+    const original = user('repeat', 'user-first');
+    const next = user('repeat', 'user-next');
+    const input = [original, call('call-first', 'one.txt'), first, next, call('call-next', 'two.txt'), second];
+    const repair = dedupeReplayedHistory(input);
+    expect(repair.messages).toEqual(input);
+    expect(repair.toolCalls).toBe(0);
+    const rebuilt = engineMessages(repair.messages).messages;
+    expect(rebuilt.filter((m) => m.role === 'user' && m.text === 'repeat')).toEqual([original, next]);
+    expect(rebuilt.flatMap((m) => m.toolUses.map((u) => u.input['file_path']))).toEqual(['one.txt', 'two.txt']);
+    expect(rebuilt.flatMap((m) => (m.toolResults ?? []).map((r) => r.text)))
+      .toEqual(['[full output: C:/pages/one.txt]', '[full output: C:/pages/two.txt]']);
+  });
+
+  it('keeps equal tool payloads with different IDs and their distinct page references', () => {
+    const input = [
+      user('run this', 'first-user'),
+      assistant('', [['first-id', 'Bash', 'result one']]),
+      results([['first-id', '[full output: C:/synthetic-pages/first-id.call.txt]']]),
+      user('run it again', 'second-user'),
+      assistant('', [['second-id', 'Bash', 'result two']]),
+      results([['second-id', '[full output: C:/synthetic-pages/second-id.call.txt]']]),
+    ];
+    const repaired = dedupeReplayedHistory(input);
+    expect(repaired.toolCalls).toBe(0);
+    expect(repaired.messages).toEqual(input);
+    expect(engineMessages(repaired.messages).messages.flatMap((message) =>
+      message.toolResults ?? []).map((result) => result.text)).toEqual([
+      '[full output: C:/synthetic-pages/first-id.call.txt]',
+      '[full output: C:/synthetic-pages/second-id.call.txt]',
+    ]);
   });
 });
 
