@@ -12,9 +12,10 @@ import { assistantTextCandidateIndices, compact, compactionCandidates, reduction
 import { collectToolCalls, goalFromMessages } from '../src/state.js';
 import { buildJevRequest, DEFAULT_MODEL, OPENROUTER_SYSTEM_ONE_URL, parseJevResponse, SYSTEM_ONE_URL } from '../src/request.js';
 import { callPage, longInputCalls } from '../src/inputs.js';
-import { THINKING_TOKENS_PER_BLOCK } from '../src/size.js';
+import { THINKING_TOKENS_PER_BLOCK, usageOrigin, usageSourceText, type UsageOrigin } from '../src/size.js';
 import {
   dedupeReplayedHistory,
+  collapseContextListings,
   dropCommandNoise,
   engineMessages,
   restoreQueuedPrompts,
@@ -82,8 +83,6 @@ const JEV_RETRY_DELAYS_MS = [1_000, 2_000, 4_000, 8_000, 15_000];
 const JEV_MAX_RETRY_AFTER_MS = 30_000;
 /** Wall-clock budget for all Jev requests of one compaction, retries included. */
 export const JEV_TOTAL_BUDGET_MS = 150_000;
-/** After an auto-compaction attempt, the next one waits until the context grows this share of the window. */
-const AUTO_RECOMPACT_GROWTH = 0.1;
 
 export type JevTransportStats = {
   batches: number;
@@ -349,9 +348,9 @@ export function summarize(result: CompactResult): string {
   } in ${stats.requests} request(s)${paging}`;
 }
 
-/** What Claude Code's own line after a compaction is, so it is not taken for the size. */
+/** Desktop's saved number belongs to Claude Code, not to the plugin or a verified request. */
 const ENGINE_FIGURE_NOTE =
-  'Claude Code\'s own "saved N tokens" line is characters/4 of the messages without the system prompt and tools, not the size';
+  'engine-owned Desktop "saved N tokens" line is not controlled by the plugin and is not verified input usage';
 
 /**
  * The size report, in Claude tokens. `before` is the real context of the
@@ -367,28 +366,32 @@ export function sizeReport(
   thinkingRows: number,
   reloaded = false,
   overhead?: number,
+  origin: UsageOrigin = 'engine',
 ): string {
   const cut = Math.max(0, visibleBefore - visibleAfter);
-  // Measured after the last compaction: the context to come is it plus the
-  // kept messages, whatever the thinking and the reloads were.
+  const provenance = usageSourceText(origin);
+  const end = `; last-request ${provenance} usage: ${before === undefined ? 'unavailable' : `${tokensText(before)} tokens`}` +
+    `; first-request input usage pending (check the next real request); ${ENGINE_FIGURE_NOTE}`;
+  // The previous request's residual is inferred from observed input minus
+  // estimated visible messages; it is not an independently measured overhead.
   if (overhead !== undefined) {
     const from = before === undefined || reloaded || visibleBefore > before ? '' : `${tokensText(before)} → `;
-    return `context ${from}≈${tokensText(overhead + visibleAfter)} tokens ` +
-      `(messages ≈${tokensText(visibleBefore)} → ≈${tokensText(visibleAfter)}, plus ≈${tokensText(overhead)} outside them as measured after the last compaction; ` +
-      `the next reply shows the exact size. ${ENGINE_FIGURE_NOTE})`;
+    return `plugin estimate: context ${from}≈${tokensText(overhead + visibleAfter)} tokens ` +
+      `(messages ≈${tokensText(visibleBefore)} → ≈${tokensText(visibleAfter)}, plus ≈${tokensText(overhead)} outside them inferred from observed input minus estimated messages on the previous compaction; ` +
+      `first-request input usage is not yet available)${end}`;
   }
   const thinking = thinkingRows * THINKING_TOKENS_PER_BLOCK;
   const thinkingText = thinkingRows > 0 ? `, ≈−${tokensText(thinking)} of ${thinkingRows} thinking block(s)` : '';
-  if (before === undefined) return `≈−${tokensText(cut + thinking)} tokens (−${tokensText(cut)} of messages${thinkingText})`;
+  if (before === undefined) return `plugin estimate: ≈−${tokensText(cut + thinking)} tokens (−${tokensText(cut)} of messages${thinkingText})${end}`;
   // The last request was measured before a reload doubled the history: that
   // figure says nothing about the context now, the messages themselves do.
   if (reloaded || visibleBefore > before) {
-    return `messages ≈${tokensText(visibleBefore)} → ≈${tokensText(visibleAfter)} tokens${thinkingText} ` +
-      `(the last measured context, ${tokensText(before)}, predates the reload that doubled the history; the next reply shows the exact size)`;
+    return `plugin estimate: messages ≈${tokensText(visibleBefore)} → ≈${tokensText(visibleAfter)} tokens${thinkingText} ` +
+      `(the last context usage, ${tokensText(before)}, predates the reload that doubled the history)${end}`;
   }
   const after = Math.max(0, before - cut - thinking);
-  return `context ${tokensText(before)} → ≈${tokensText(after)} tokens ` +
-    `(−${tokensText(cut)} of messages${thinkingText}; the next reply shows the exact size. ${ENGINE_FIGURE_NOTE})`;
+  return `plugin estimate: context ${tokensText(before)} → ≈${tokensText(after)} tokens ` +
+    `(−${tokensText(cut)} of messages${thinkingText}; next request still unmeasured)${end}`;
 }
 
 const UI_LOG_MAX_CHARS = 4096;
@@ -585,9 +588,14 @@ export async function writeCallPages(
 ): Promise<Set<string>> {
   let existing = new Set<string>();
   try {
-    existing = new Set((await $.fs.list(dir)).map((entry) => entry.name));
-  } catch {
-    // No directory yet (or no listing): every page is written.
+    existing = new Set((await $.fs.list(dir)).map((entry) => entry.name.toLowerCase()));
+  } catch (error) {
+    // A genuinely absent directory has no pages to overwrite. An unreadable
+    // directory might hold immutable originals; fail closed rather than
+    // overwriting one. The transcript remains the fallback source.
+    const code = (error as { code?: unknown } | null)?.code;
+    const message = error instanceof Error ? error.message : '';
+    if (code !== 'ENOENT' && !/\bENOENT\b/.test(message)) return new Set();
   }
   const results = resultTextsOf(messages);
   const tools = new Map(messages.flatMap((m) => m.toolUses).map((tool) => [tool.tool_use_id, tool]));
@@ -596,7 +604,7 @@ export async function writeCallPages(
     const id = call.tool_use_id;
     const name = `${id}.call.txt`;
     if (!/^[A-Za-z0-9_-]+$/.test(id) || JSON.stringify(call.input).length + call.resultChars < PAGE_MIN_CHARS) continue;
-    if (existing.has(name)) {
+    if (existing.has(name.toLowerCase())) {
       paged.add(id);
       continue;
     }
@@ -654,10 +662,11 @@ async function recordOverhead($: StoreTarget, overhead: number): Promise<void> {
 type Effect = { before?: number; visibleAfter: number };
 
 /**
- * The real size of the first request after a compaction, and what of it lay
- * outside the kept messages, stored for the next ceiling.
+ * The real input usage of the first request after compaction. The residual
+ * outside visible messages is only inferred (observed usage minus the plugin
+ * estimate of visible text), not a separately measured token count.
  */
-async function reportEffect($: NotifyTarget & StoreTarget, gate: ToastGate, effect: Effect, tokens: number): Promise<void> {
+async function reportEffect($: NotifyTarget & StoreTarget, gate: ToastGate, effect: Effect, tokens: number, origin: UsageOrigin): Promise<void> {
   const { before, visibleAfter } = effect;
   const saved = before === undefined ? 0 : before - tokens;
   const overhead = tokens - visibleAfter;
@@ -665,11 +674,11 @@ async function reportEffect($: NotifyTarget & StoreTarget, gate: ToastGate, effe
   await sayNotice(
     $,
     gate,
-    `fast-jev ${LOCAL_BUILD}: first request after compaction carried ${tokensText(tokens)} tokens` +
+    `fast-jev ${LOCAL_BUILD}: first-request input usage [${usageSourceText(origin)}] ${tokensText(tokens)} tokens` +
       (before === undefined
         ? ' (the size before it was not measured after the reload)'
         : ` (before: ${tokensText(before)}; ${saved > 0 ? `−${tokensText(saved)}, −${percent(saved / before)}` : 'no reduction'}, the new prompt included)`) +
-      (overhead > 0 ? `; ≈${tokensText(overhead)} of it is outside the kept messages (system prompt, tools, listings, CLAUDE.md, attachments, the new prompt), which the next ceiling counts on` : ''),
+      (overhead > 0 ? `; ≈${tokensText(overhead)} inferred outside the kept messages (observed input minus plugin-estimated messages; includes system prompt, tools, listings, CLAUDE.md, attachments and the new prompt), which the next ceiling budgets for` : ''),
   );
 }
 const QUEUED_PER_SESSION = 50;
@@ -724,16 +733,12 @@ export async function forgetQueued($: StoreTarget, sessionId: string, done: read
 export const register: Register = (on: On, options: PluginOptions) => {
   const configured = resolveHookConfig(options);
   const gate = toastGate();
-  let compacting = false;
-  /** Context size when auto-compaction last ran; the next run waits for real growth. */
-  let lastAutoTokens: number | undefined;
   /**
    * Set when a compaction stood, to report its real effect at the next turn;
    * `before` is left out when the last measurement predates a reload;
    * `visibleAfter` measures the overhead the next target counts on.
    */
   let effectPending: Effect | undefined;
-  let lastAutoError = '';
   // Only affects ordering, never a deletion decision. Later passes advance
   // through the remaining candidates instead of rescoring the same large keeps.
   const reviewedToolUseIds = new Set<string>();
@@ -762,12 +767,14 @@ export const register: Register = (on: On, options: PluginOptions) => {
       const queued = sessionId ? await readQueued($, sessionId) : [];
       const restoring = restoreQueuedPrompts(deduped.messages, queued);
       const noise = dropCommandNoise(restoring.messages, resolveOptions(configured).preserveRecentMessages);
-      const input = noise.messages;
+      const listings = collapseContextListings(noise.messages);
+      const input = listings.messages;
       const repairs = [
         deduped.toolCalls > 0 ? `${deduped.toolCalls} duplicated call(s) removed` : '',
         deduped.texts > 0 ? `${deduped.texts} duplicated text(s) removed` : '',
         restoring.restored.length > 0 ? `${restoring.restored.length} mid-turn user message(s) kept as text` : '',
         noise.dropped > 0 ? `${noise.dropped} old command output(s) dropped` : '',
+        listings.dropped > 0 ? `${listings.dropped} repeated context listing(s) dropped` : '',
       ].filter(Boolean);
       const thinkingRows = thinkingOnlyRows(input);
       // Refuses now, before any Jev request, when a call still waits for its result.
@@ -820,11 +827,13 @@ export const register: Register = (on: On, options: PluginOptions) => {
 
       let tokensBefore: number | undefined;
       let window: number | undefined;
+      let origin: UsageOrigin = 'engine';
       if (main) {
         try {
           const { context } = await $.session.usage();
           tokensBefore = context.tokens;
           window = context.window;
+          origin = usageOrigin(context);
         } catch {
           // Only the size report and the target need it.
         }
@@ -929,7 +938,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
         $,
         gate,
         `${tag}: done in ${Math.round((Date.now() - started) / 1000)} s, no summary; ` +
-          `${sizeReport(tokensBefore, visibleBefore, visibleAfter, rebuilt.thinkingRows, reloaded, overhead)}. ${parts.join('; ')}` +
+          `${sizeReport(tokensBefore, visibleBefore, visibleAfter, rebuilt.thinkingRows, reloaded, overhead, origin)}. ${parts.join('; ')}` +
           (result ? `; ${transportSummary(transport)}` : ''),
       );
       if (sessionId && (restoring.restored.length > 0 || restoring.present.length > 0)) {
@@ -938,8 +947,6 @@ export const register: Register = (on: On, options: PluginOptions) => {
       if (main && event.trigger !== 'precompute') pageIns = 0;
       if (tokensBefore !== undefined && event.trigger !== 'precompute') {
         effectPending = reloaded ? { visibleAfter } : { before: tokensBefore, visibleAfter };
-        // Manual compaction also starts the auto-compaction cooldown.
-        lastAutoTokens = tokensBefore;
       }
       return { messages: rebuilt.messages };
     } catch (error) {
@@ -965,13 +972,13 @@ export const register: Register = (on: On, options: PluginOptions) => {
   // of a long turn as overhead.
   on('tool.call', async ($, event, next) => {
     if (event.agentId !== undefined) return next(event);
-    if (effectPending !== undefined && !compacting) {
+    if (effectPending !== undefined) {
       try {
         const { context } = await $.session.usage();
         const effect = effectPending;
         if (context.tokens !== undefined && effect !== undefined) {
           effectPending = undefined;
-          await reportEffect($, gate, effect, context.tokens);
+          await reportEffect($, gate, effect, context.tokens, usageOrigin(context));
         }
       } catch {
         // Measured at the turn's end instead.
@@ -1003,42 +1010,22 @@ export const register: Register = (on: On, options: PluginOptions) => {
     return answer;
   });
 
-  // Auto-compaction through Jev. The engine's own auto-compact (a Claude
-  // summary) is meant to be off: DISABLE_AUTO_COMPACT=1. The call goes after
-  // `next(event)`: until core has closed the turn, `$.session.compact()` rejects
-  // with "a turn is running". Subagent turns never trigger it.
+  // Manual-only: NEVER call $.session.compact() from turn.complete, regardless
+  // of context pressure. DISABLE_AUTO_COMPACT and the PreCompact guard remain
+  // the independent engine-side safety nets; explicit /compact uses the
+  // session.compact hook above, which never delegates to built-in summary.
   on('turn.complete', async ($, event: TurnCompleteInput, next) => {
     const answer = await next(event);
-    if (compacting || event.agentId !== undefined) return answer;
+    if (event.agentId !== undefined || effectPending === undefined) return answer;
     try {
       const { context } = await $.session.usage();
-      if (context.tokens === undefined || context.percent === undefined) return answer;
-      const effect = effectPending;
-      if (effect !== undefined) {
+      if (context.tokens !== undefined && effectPending !== undefined) {
+        const effect = effectPending;
         effectPending = undefined;
-        await reportEffect($, gate, effect, context.tokens);
+        await reportEffect($, gate, effect, context.tokens, usageOrigin(context));
       }
-      if (context.percent < configured.compactAtPercent) return answer;
-      if (
-        lastAutoTokens !== undefined &&
-        context.tokens < lastAutoTokens + context.window * AUTO_RECOMPACT_GROWTH
-      ) {
-        return answer;
-      }
-      compacting = true;
-      $.ui.log(
-        `fast-jev ${LOCAL_BUILD}: context ${context.percent}% >= ${configured.compactAtPercent}%, auto-compacting`,
-      );
-      await $.session.compact();
-      lastAutoTokens = context.tokens;
-      lastAutoError = '';
-    } catch (error) {
-      const text = `fast-jev ${LOCAL_BUILD}: auto-compact did not run (${errorText(error)})`;
-      if (text !== lastAutoError) progressNotice($, gate, text);
-      else $.ui.log(text);
-      lastAutoError = text;
-    } finally {
-      compacting = false;
+    } catch {
+      // Keep the pending measurement for the next eligible tool or turn.
     }
     return answer;
   });

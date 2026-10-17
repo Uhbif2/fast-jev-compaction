@@ -64,36 +64,134 @@ function keepsHandle(message: EngineMessage): boolean {
 
 export type Dedupe<T> = { messages: T[]; toolCalls: number; texts: number };
 
+/** Consecutive assistant text rows adjacent to an anchored tool call/result. */
+function adjacentAssistantText<T extends Message>(
+  messages: readonly T[], anchor: number, direction: -1 | 1,
+): number[] {
+  const indices: number[] = [];
+  for (let index = anchor + direction; index >= 0 && index < messages.length; index += direction) {
+    const row = messages[index]!;
+    if (row.role !== 'assistant' || row.toolUses.length > 0 || row.text.trim().length === 0) break;
+    if (direction === -1) indices.unshift(index);
+    else indices.push(index);
+  }
+  return indices;
+}
+
+/**
+ * A duplicate tool ID proves only the tool was replayed, NOT that every equal
+ * assistant statement in the user turn was replayed. Text is removable only
+ * when a complete matching response is aligned next to that repeated call or
+ * result AND all its parts retain the original assistant source handle.
+ * Rebuilt responses without a stable handle are ambiguous and stay intact,
+ * even when their text is identical to older prose.
+ */
+function replayedAssistantTextIndices<T extends Message>(messages: readonly T[]): Set<number> {
+  const repeated = new Set<number>();
+  let firstUse = new Map<string, number>();
+  let firstResult = new Map<string, number>();
+
+  function matchAnchoredRuns(original: number[], duplicate: number[]): void {
+    if (!original.length || !duplicate.length) return;
+    const originalTexts = original.map((index) => ({
+      text: messages[index]!.text.trim(),
+      // A text row can only be attributed to a replay when the source
+      // identity is stable. Equal prose next to a repeated tool ID is not
+      // enough: independently authored replies may occupy that position.
+      handle: (messages[index] as Message & { handle?: unknown }).handle,
+    }));
+    let duplicateCursor = 0;
+    // A joined row may appear twice on reload: once joined and once as its
+    // original consecutive fragments. Consume only whole, aligned responses.
+    for (const expected of originalTexts) {
+      while (duplicateCursor < duplicate.length) {
+        let joined = '';
+        let found = false;
+        for (let next = duplicateCursor; next < duplicate.length; next += 1) {
+          joined = joinText(joined, messages[duplicate[next]!]!.text).trim();
+          if (joined === expected.text) {
+            // An assistant message has provenance only if all its replayed
+            // pieces carry the SAME non-empty engine source handle.
+            if (typeof expected.handle === 'string' && expected.handle.length > 0 &&
+                duplicate.slice(duplicateCursor, next + 1).every((i) =>
+                  (messages[i] as Message & { handle?: unknown }).handle === expected.handle)) {
+              for (let i = duplicateCursor; i <= next; i += 1) repeated.add(duplicate[i]!);
+            }
+            duplicateCursor = next + 1;
+            found = true;
+            break;
+          }
+          if (!expected.text.startsWith(`${joined}\n\n`)) break;
+        }
+        if (!found) return;
+        // Another exact copy of the same complete response can immediately
+        // follow the first one, reconstructed from individual original rows.
+        if (duplicateCursor >= duplicate.length ||
+            !expected.text.startsWith(messages[duplicate[duplicateCursor]!]!.text.trim())) break;
+      }
+    }
+  }
+
+  for (let index = 0; index < messages.length; index += 1) {
+    const message = messages[index]!;
+    if (message.role === 'user' && !isToolResultRow(message) && message.text.trim().length > 0) {
+      firstUse = new Map();
+      firstResult = new Map();
+    }
+    if (message.role === 'assistant') {
+      for (const call of message.toolUses) {
+        const initial = firstUse.get(call.tool_use_id);
+        if (initial === undefined) firstUse.set(call.tool_use_id, index);
+        else matchAnchoredRuns(
+          adjacentAssistantText(messages, initial, -1),
+          adjacentAssistantText(messages, index, -1),
+        );
+      }
+    }
+    for (const result of message.toolResults ?? []) {
+      const initial = firstResult.get(result.tool_use_id);
+      if (initial === undefined) firstResult.set(result.tool_use_id, index);
+      else matchAnchoredRuns(
+        adjacentAssistantText(messages, initial, 1),
+        adjacentAssistantText(messages, index, 1),
+      );
+    }
+  }
+  return repeated;
+}
+
 /**
  * Removes what a reload of a damaged transcript doubled: a repeated tool_use
- * id and its repeated result (the first occurrence stays), and an assistant
- * text repeated verbatim within the same user turn. User text is never
- * touched. Untouched messages keep their identity.
+ * id and its repeated result (the first occurrence stays). Tool ID equality
+ * alone does not prove that an unrelated assistant message was duplicated;
+ * only anchored matching text sequences may be removed. User text is untouched.
  */
 export function dedupeReplayedHistory<T extends Message>(messages: readonly T[]): Dedupe<T> {
+  const replayedTexts = replayedAssistantTextIndices(messages);
   const uses = new Set<string>();
   const results = new Set<string>();
-  let turnTexts = new Set<string>();
   let toolCalls = 0;
   let texts = 0;
   const out: T[] = [];
-  for (const message of messages) {
+  for (let index = 0; index < messages.length; index += 1) {
+    const message = messages[index]!;
+    // Tool IDs only identify calls within a user turn. A new, independently
+    // submitted user message may legitimately reuse an earlier tool ID.
     if (message.role === 'user' && !isToolResultRow(message) && message.text.trim().length > 0) {
-      turnTexts = new Set();
+      uses.clear();
+      results.clear();
     }
     if (message.role === 'assistant') {
       const toolUses = message.toolUses.filter((tool) => !uses.has(tool.tool_use_id));
       for (const tool of toolUses) uses.add(tool.tool_use_id);
       toolCalls += message.toolUses.length - toolUses.length;
-      const text = message.text.trim();
-      const repeated = text.length > 0 && turnTexts.has(text);
-      if (text.length > 0) turnTexts.add(text);
+      const repeated = replayedTexts.has(index);
       if (repeated) texts += 1;
       if (toolUses.length === message.toolUses.length && !repeated) {
         out.push(message);
         continue;
       }
-      if (toolUses.length === 0 && (repeated || text.length === 0)) continue;
+      if (toolUses.length === 0 && (repeated || message.text.trim().length === 0)) continue;
       out.push({ ...message, text: repeated ? '' : message.text, toolUses, handle: undefined });
       continue;
     }
@@ -108,6 +206,43 @@ export function dedupeReplayedHistory<T extends Message>(messages: readonly T[])
     out.push({ ...message, toolResults: kept, handle: undefined });
   }
   return { messages: out, toolCalls, texts };
+}
+
+/**
+ * Context listings the engine re-injects on every compaction (skill listing,
+ * instructions, agent listing, CLAUDE.md memory) are not conversation: each
+ * replay appends one more copy, which the owner sees as old messages doubling.
+ * They are recognised by their kind prefix, never by text equality, so equal
+ * ordinary replies stay untouched. Only the latest copy of each kind is kept.
+ */
+const CONTEXT_LISTING = /^(skill_listing|instructions|agent_listing|nested_memory|claude_md)\s*:/;
+
+export function collapseContextListings<T extends Message>(messages: readonly T[]): { messages: T[]; dropped: number } {
+  const split = messages.map((m) => (m.role === 'assistant' ? m.text.split(/\n{2,}/) : null));
+  const last = new Map<string, [number, number]>();
+  split.forEach((parts, i) => parts?.forEach((part, j) => {
+    const kind = CONTEXT_LISTING.exec(part.trim())?.[1];
+    if (kind) last.set(kind, [i, j]);
+  }));
+  let dropped = 0;
+  const out: T[] = [];
+  messages.forEach((message, i) => {
+    const parts = split[i];
+    if (!parts) { out.push(message); return; }
+    const kept = parts.filter((part, j) => {
+      const kind = CONTEXT_LISTING.exec(part.trim())?.[1];
+      if (!kind) return true;
+      const [li, lj] = last.get(kind)!;
+      if (li === i && lj === j) return true;
+      dropped += 1;
+      return false;
+    });
+    if (kept.length === parts.length) { out.push(message); return; }
+    const text = kept.join('\n\n');
+    if (!text.trim() && message.toolUses.length === 0) return;
+    out.push({ ...message, text });
+  });
+  return { messages: out, dropped };
 }
 
 /** Local commands whose invocation and output carry nothing for the model once they are old. */
@@ -181,10 +316,15 @@ type Slot = { own: EngineMessage } | { assistant: Assistant } | { carrier: Carri
  * then the turn is still running and the compaction is refused.
  */
 export function engineMessages(output: readonly EngineMessage[]): EngineRebuild {
-  const resultsById = new Map<string, EngineToolResult>();
+  // Tool IDs can recur in a later user turn. Preserve result occurrence order
+  // rather than binding every call with an ID to the first result in history.
+  const resultsById = new Map<string, EngineToolResult[]>();
   for (const message of output) for (const result of message.toolResults ?? []) {
-    if (!resultsById.has(result.tool_use_id)) resultsById.set(result.tool_use_id, result);
+    const occurrences = resultsById.get(result.tool_use_id) ?? [];
+    occurrences.push(result);
+    resultsById.set(result.tool_use_id, occurrences);
   }
+  const resultCursor = new Map<string, number>();
   let thinkingRows = 0;
   const slots: Slot[] = [];
   for (const message of output) {
@@ -242,7 +382,9 @@ export function engineMessages(output: readonly EngineMessage[]): EngineRebuild 
     const keptUses: RebuiltMessage['toolUses'] = [];
     for (const [position, tool] of assistant.toolUses.entries()) {
       const engineUse = engineUses[position];
-      const explicit = resultsById.get(tool.tool_use_id);
+      const offset = resultCursor.get(tool.tool_use_id) ?? 0;
+      const explicit = resultsById.get(tool.tool_use_id)?.[offset];
+      if (explicit) resultCursor.set(tool.tool_use_id, offset + 1);
       let result: { tool_use_id: string; text: string; isError: boolean } | undefined;
       if (explicit) result = { tool_use_id: explicit.tool_use_id, text: explicit.text, isError: explicit.isError ?? false };
       else if (engineUse?.text !== undefined) {
