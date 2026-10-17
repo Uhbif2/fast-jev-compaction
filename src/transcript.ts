@@ -209,31 +209,67 @@ export function dedupeReplayedHistory<T extends Message>(messages: readonly T[])
 }
 
 /**
- * Context listings the engine re-injects on every compaction (skill listing,
- * instructions, agent listing, CLAUDE.md memory) are not conversation: each
- * replay appends one more copy, which the owner sees as old messages doubling.
- * They are recognised by their kind prefix, never by text equality, so equal
- * ordinary replies stay untouched. Only the latest copy of each kind is kept.
+ * A listing-shaped assistant answer is NOT proof of engine provenance. Earlier
+ * versions dropped every older "instructions:" paragraph by prefix, even when
+ * two separate user turns had different, independently authored answers.
+ *
+ * Without an explicit engine marker, collapse only a strong replay footprint:
+ * two or more distinct listing kinds with identical complete payloads repeated
+ * within the SAME user turn. An isolated kind, a changed payload, a user-turn
+ * boundary or a row mixed with ordinary prose is ambiguous and must survive.
+ * Repeated rows with the SAME nonempty source handle have stronger provenance
+ * and may be collapsed without the two-kind footprint.
  */
-const CONTEXT_LISTING = /^(skill_listing|instructions|agent_listing|nested_memory|claude_md)\s*:/;
+const CONTEXT_LISTING = /^(skill_listing|instructions|agent_listing|nested_memory|claude_md)\s*:\s*\S/;
+type ListingPart = { row: number; part: number; turn: number; kind: string; text: string; handle?: string };
 
 export function collapseContextListings<T extends Message>(messages: readonly T[]): { messages: T[]; dropped: number } {
-  const split = messages.map((m) => (m.role === 'assistant' ? m.text.split(/\n{2,}/) : null));
-  const last = new Map<string, [number, number]>();
-  split.forEach((parts, i) => parts?.forEach((part, j) => {
-    const kind = CONTEXT_LISTING.exec(part.trim())?.[1];
-    if (kind) last.set(kind, [i, j]);
-  }));
+  const split = messages.map((m) => m.role === 'assistant' ? m.text.split(/\n{2,}/) : null);
+  const occurrences = new Map<string, ListingPart[]>();
+  const qualified = new Set<string>();
+  let turn = -1;
+  messages.forEach((m, row) => {
+    if (m.role === 'user' && !isToolResultRow(m) && m.text.trim()) turn += 1;
+    const parts = split[row];
+    // A prefix in an authored explanation must not become a removable fragment.
+    if (!parts || m.toolUses.length > 0 || !parts.every(p => CONTEXT_LISTING.test(p.trim()))) return;
+    for (let part = 0; part < parts.length; part += 1) {
+      const text = parts[part]!.trim();
+      const kind = CONTEXT_LISTING.exec(text)![1]!;
+      const key = JSON.stringify([turn, kind, text]);
+      const handle = (m as Message & { handle?: unknown }).handle;
+      const occurrence: ListingPart = { row, part, turn, kind, text };
+      if (typeof handle === 'string' && handle.length) occurrence.handle = handle;
+      occurrences.set(key, [...(occurrences.get(key) ?? []), occurrence]);
+    }
+  });
+  const repeatedKinds = new Map<number, Set<string>>();
+  for (const [key, entries] of occurrences) {
+    if (entries.length < 2) continue;
+    const kinds = repeatedKinds.get(entries[0]!.turn) ?? new Set<string>();
+    kinds.add(entries[0]!.kind);
+    repeatedKinds.set(entries[0]!.turn, kinds);
+    // Source handles identify an exact engine row even for a lone listing kind.
+    if (entries[0]!.handle && entries.every(e => e.handle === entries[0]!.handle)) qualified.add(key);
+  }
+  for (const [key, entries] of occurrences) {
+    if (entries.length > 1 && (repeatedKinds.get(entries[0]!.turn)?.size ?? 0) >= 2) {
+      qualified.add(key);
+    }
+  }
+  const drop = new Set<string>();
+  for (const key of qualified) {
+    const entries = occurrences.get(key)!;
+    // Keep the latest complete copy, never delete distinct listing contents.
+    for (const entry of entries.slice(0, -1)) drop.add(JSON.stringify([entry.row, entry.part]));
+  }
   let dropped = 0;
   const out: T[] = [];
-  messages.forEach((message, i) => {
-    const parts = split[i];
+  messages.forEach((message, row) => {
+    const parts = split[row];
     if (!parts) { out.push(message); return; }
-    const kept = parts.filter((part, j) => {
-      const kind = CONTEXT_LISTING.exec(part.trim())?.[1];
-      if (!kind) return true;
-      const [li, lj] = last.get(kind)!;
-      if (li === i && lj === j) return true;
+    const kept = parts.filter((_, part) => {
+      if (!drop.has(JSON.stringify([row, part]))) return true;
       dropped += 1;
       return false;
     });

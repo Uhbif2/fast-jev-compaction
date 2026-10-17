@@ -1,8 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
+import { execFileSync } from 'node:child_process';
+import { resolve } from 'node:path';
 import { compact, compactionCandidates, messageChars, transcriptChars, truncatedResultText } from '../src/compact.js';
 import { collectToolCalls, estimateTokens, fitBatchStates, hasSideEffects, isCompactedResult } from '../src/state.js';
 import { noulAnswer, parseJevResponse } from '../src/request.js';
-import { jevAsker } from '../hooks/fast-jev.js';
+import { jevAsker, register } from '../hooks/fast-jev.js';
+import { collapseContextListings } from '../src/transcript.js';
 import type { CompactionState, JevAsker, Message } from '../src/types.js';
 
 const text = (role: Message['role'], body: string): Message => ({ role, text: body, toolUses: [] });
@@ -17,6 +20,94 @@ function pair(tool = 'Bash'): Message[] {
 const low: JevAsker = { async ask(_state, questions) {
   return { answers: Object.fromEntries(Object.keys(questions).map((key) => [key, { noul: 0.001 }])) };
 } };
+
+describe('production context listing provenance', () => {
+  it('does not discard isolated prefixes, changed payloads or independent user turns', () => {
+    const messages = [
+      text('user', 'first question'),
+      text('assistant', 'instructions: one answer'),
+      text('user', 'second question'),
+      text('assistant', 'instructions: one answer'),
+      text('assistant', 'instructions: a different answer'),
+      text('assistant', 'explanation first\n\ninstructions: quoted within my answer'),
+    ];
+    const result = collapseContextListings(messages);
+    expect(result.dropped).toBe(0);
+    expect(result.messages).toEqual(messages);
+  });
+
+  it('recognizes the two-kind same-turn listing replay but keeps changed source text', () => {
+    const messages = [
+      text('user', 'start'),
+      text('assistant', 'skill_listing: injected tools\n\ninstructions: injected rules'),
+      text('assistant', 'skill_listing: injected tools\n\ninstructions: injected rules'),
+      text('assistant', 'instructions: separate authored guidance'),
+      text('user', 'continue'),
+      text('assistant', 'instructions: new turn'),
+    ];
+    const result = collapseContextListings(messages);
+    expect(result.dropped).toBe(2);
+    expect(result.messages.map(m => m.text)).toEqual([
+      'start',
+      'skill_listing: injected tools\n\ninstructions: injected rules',
+      'instructions: separate authored guidance',
+      'continue',
+      'instructions: new turn',
+    ]);
+  });
+
+
+  it('preserves distinct assistant instructions across user turns during real session.compact', async () => {
+    const handlers: Record<string, (...args: any[]) => Promise<any>> = {};
+    register(((name: string, one: unknown, two?: unknown) => {
+      handlers[name] = (two ?? one) as (...args: any[]) => Promise<any>;
+    }) as never, { preserveRecentMessages: 1, compactAssistantText: false, questionVariant: 'keep_or_page' } as never);
+    const originalResult = 'synthetic tool result '.repeat(200);
+    const messages = [
+      { ...text('user', 'First task'), handle: 'user-1' },
+      { ...text('assistant', 'instructions: Answer to first task'), handle: 'assistant-1' },
+      { ...text('assistant', ''), toolUses: [{ tool_use_id: 'one-tool', tool: 'Bash', input: { command: 'mock' }, text: originalResult }], handle: 'call' },
+      { ...text('user', ''), toolResults: [{ tool_use_id: 'one-tool', text: originalResult, isError: false }], handle: 'result' },
+      { ...text('user', 'Second task'), handle: 'user-2' },
+      { ...text('assistant', 'instructions: Different answer to second task'), handle: 'assistant-2' },
+      { ...text('user', 'Please continue'), handle: 'user-3' },
+    ];
+    const written = new Map<string, string>();
+    let jevRequests = 0;
+    const $ = {
+      store: { get: async () => undefined, set: async () => {} },
+      ui: { log: () => {}, toast: () => {} },
+      env: { get: async (name: string) => name === 'USERPROFILE' ? 'C:/synthetic-home' : 'synthetic-key' },
+      fs: { write: async (path: string, body: string) => { written.set(path, body); }, list: async () => [] },
+      settings: { read: async () => ({}) },
+      clock: { sleep: async () => {} },
+      http: { fetch: async (_url: string, init?: { body?: string }) => {
+        jevRequests += 1;
+        const questions = Object.keys((JSON.parse(init?.body ?? '{}') as { questions?: object }).questions ?? {});
+        return { status: 200, ok: true, text: JSON.stringify({
+          answers: Object.fromEntries(questions.map(k => [k, { noul: 0.001 }])),
+        }), headers: {} };
+      } },
+      session: {
+        id: async () => 'synthetic-session',
+        cwd: async () => 'C:/synthetic-work',
+        messages: async () => [],
+        usage: async () => ({ context: { tokens: 12_000, percent: 40, window: 50_000, measurementSource: 'synthetic/mock' }, rateLimits: [] }),
+        compact: async () => ({ skip: 'unused mock' }),
+      },
+    };
+    const next = async () => { throw Error('built-in summary must never be invoked'); };
+    const outcome = await handlers['session.compact']!($, { trigger: 'manual', messages }, next);
+    expect(outcome.skip).toBeUndefined();
+    const textAfter = outcome.messages.map((m: Message) => m.text).join('\n');
+    expect(textAfter).toContain('instructions: Answer to first task');
+    expect(textAfter).toContain('instructions: Different answer to second task');
+    expect(textAfter).toContain('First task');
+    expect(textAfter).toContain('Second task');
+    expect(jevRequests).toBeGreaterThan(0);
+    expect(written.size).toBeGreaterThan(0);
+  });
+});
 
 describe('long dialogue coverage', () => {
   it('covers every character of oversized user and assistant turns and stays inside both request limits', async () => {
@@ -210,5 +301,76 @@ describe('transport deadline and untrusted responses', () => {
     for (const noul of [-0.1, 1.1, NaN, Infinity]) {
       expect(() => noulAnswer({ t: { noul } }, 't')).toThrow('Invalid Jev answer');
     }
+  });
+});
+
+describe('TZ-703 synthetic hook replay on real production register', () => {
+  function runOfflineReplay() {
+    const stdout = execFileSync(
+      process.execPath,
+      ['--import', 'tsx', resolve('scripts/hook-replay.ts'), '--synthetic'],
+      { encoding: 'utf8', timeout: 20_000 },
+    );
+    return { stdout, report: JSON.parse(stdout) as {
+      mode: string; passed: boolean; checks: Array<{ id: string; ok: boolean; reason: string }>;
+      jevRequests: number; pageCount: number; builtInCalls: number; automaticCalls: number;
+    } };
+  }
+
+  it('executes synthetic manual and repeated compaction with literal, immutable pages and no Claude fallback', () => {
+    const { stdout, report } = runOfflineReplay();
+    expect(report.mode).toBe('synthetic/offline');
+    expect(report.passed).toBe(true);
+    expect(report.checks.map(({ id, ok }) => [id, ok])).toEqual([
+      ['S1.manual_real_hook', true],
+      ['S1.measured_usage', true],
+      ['S2.replayed_tool_payload', true],
+      ['S2.call_result_pairing', true],
+      ['S2.immutable_page', true],
+      ['S2.user_verbatim', true],
+      ['S3.autocompact_off', true],
+    ]);
+    expect(report.jevRequests).toBeGreaterThan(0);
+    expect(report.pageCount).toBeGreaterThan(0);
+    expect(report.builtInCalls).toBe(0);
+    expect(report.automaticCalls).toBe(0);
+    // The harness emits sanitized counts/reasons only, not even its fake auth.
+    expect(stdout).not.toContain('synthetic-key');
+    expect(stdout).not.toContain('HEAD synthetic-result');
+    expect(stdout).not.toMatch(/Authorization|apiKey|\.claude\/credentials|historical output/i);
+  });
+
+  it('is deterministic across two independent offline executions', () => {
+    const first = runOfflineReplay();
+    const second = runOfflineReplay();
+    expect(second.report).toEqual(first.report);
+  });
+
+  it('honours a synthetic Retry-After while sending Jev requests sequentially with no sensitive logging', async () => {
+    let attempts = 0;
+    let inFlight = 0;
+    let peak = 0;
+    const delays: number[] = [];
+    const logs: string[] = [];
+    const metrics = { batches: 0, attempts: 0, retries: 0 };
+    const fetch = async () => {
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      attempts += 1;
+      try {
+        if (attempts === 1) return { status: 429, ok: false, text: 'synthetic PRIVATE_SENTINEL', headers: { 'retry-after': '2' } };
+        return { status: 200, ok: true, text: '{"answers":{}}', headers: {} };
+      } finally {
+        inFlight -= 1;
+      }
+    };
+    const ask = jevAsker(fetch, 'synthetic-private-key', 'jev-test',
+      (line) => logs.push(line), metrics, async (ms) => { delays.push(ms); }, 15_000);
+    expect((await ask.ask({ session: 'synthetic' }, {})).answers).toEqual({});
+    expect((await ask.ask({ session: 'synthetic' }, {})).answers).toEqual({});
+    expect(peak).toBe(1);
+    expect(delays).toEqual([2_000]);
+    expect(metrics).toEqual({ batches: 2, attempts: 3, retries: 1 });
+    expect(logs.join(' ')).not.toMatch(/PRIVATE_SENTINEL|synthetic-private-key|Authorization/);
   });
 });
