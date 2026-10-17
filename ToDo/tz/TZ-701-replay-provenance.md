@@ -5,7 +5,7 @@ owns:
   - tests/transcript.test.ts
   - tests/replay.test.ts
   - tests/register.test.ts
-needs: []
+needs: [TZ-702]
 acceptance:
   - npm run typecheck
   - npm test -- tests/transcript.test.ts tests/replay.test.ts tests/register.test.ts
@@ -30,6 +30,8 @@ Tests-first на синтетическом журнале: два replay, од�
 ## Передача
 После TZ-701 блок совместного hook replay проверяет TZ-703. Никаких реальных Jev ключей, профилей и платных вызовов.
 
+**Интеграционная зависимость на TZ-702:** проверка `npm run typecheck` включает `tsconfig.hooks.json`; `hooks/fast-jev.ts` импортирует `UsageOrigin`, `usageOrigin` и `usageSourceText` из `src/size.ts`. Оба файла принадлежат TZ-702, поэтому её принятую пару нужно включить в интегрированный HEAD **до** replay-проверки TZ-701. Не полагаться на незакоммиченный `src/size.ts` из общего дерева, не переносить его в `owns` TZ-701 и не убирать typecheck из приёмки. Отсутствие трёх экспортов в чистом HEAD — блокер интеграции TZ-702, а не разрешение ослабить provenance-контракт TZ-701.
+
 ## Итог · fix:TZ-701:3 (W4053, claim_id=14405, 15.10.2026)
 
 - RED→GREEN: добавлены отрицательные регрессии на два самостоятельных одинаковых assistant replies непосредственно до повторного `tool_use` и после повторного `tool_result` (разные `handle`). До fix оба удаляли второй reply, после fix сохраняются и в результате `engineMessages`.
@@ -44,3 +46,8 @@ Tests-first на синтетическом журнале: два replay, од�
 - **Оставшийся конфликт после fix:TZ-701:3:** его точный red/green для `src/transcript.ts` закрывает текстовую ошибку, но интеграционный `tests/register.test.ts:163–179` продолжает требовать удалить вторую копию текста с новым `h3-copy` и ожидать `duplicated text removed=1`. Это конфликт с текущим кодом, не повод снова удалить законную реплику. Предыдущая приёмка не запускала этот тест.
 - **Исправлена постановка, не код:** `tests/register.test.ts` добавлен в owns и targeted acceptance, полный `npm test` стал обязательным; раздел приёмки теперь требует независимые actual model-input позитивные/негативные проверки с одинаковыми и разными/пустыми source handles, связанными tool uses/results, user turn, immutable page. Следующий фикс должен устранить конфликт интеграционной фикстуры и вернуть full-suite rc=0, сохраняя запрещённый к удалению assistant text.
 - **Точка продолжения:** принять или доработать `fix:TZ-701:3` по новому контракту, внести интеграционное исправление только владельцем соответствующей code-claim, выполнить три YAML acceptance с фиксацией rc и содержательным сравнением expected/actual; никаких live Jev вызовов и переписывания исходных JSONL.
+
+## Revalidation · W4153 / claim_id=14611 (15.10.2026)
+
+- **Фактическое расхождение:** обязательный тест `preserves a repeated tool ID in a new user turn and maps each page to its call` выявил `rc=1` (57/58) на текущем коде: глобальная дедупликация `tool_use_id` уничтожала call/result законного нового user turn; `engineMessages` повторно использовал первый result для одинакового ID. Исторический accept 553509 остаётся историческим, этот новый отчёт не выдаётся за старую file seal.
+- **Исправление и точка продолжения:** `src/transcript.ts` сбрасывает tool ID sets на следующем user text, `engineMessages` связывает ID с последовательными результатами. После правки `npm run typecheck` rc=0, YAML targeted suite 58/58 rc=0, `npm test` 120/120 rc=0; fleet subset 26/26 rc=0. Подробная карта проверки в `ToDo/integration-revalidation/371c09f2a685cd13.md`. **Далее:** независимый ревьюер проверяет sealed files кандидата HEAD+owns; dirty tree не доказывает release/live PASS.
