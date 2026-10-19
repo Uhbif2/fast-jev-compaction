@@ -8,7 +8,7 @@
       "name": "fast-jev-compaction-local",
       "source": "./",
       "description": "Local hardened fast-jev compaction: Jev-only (never a Claude summary), conservative tool relevance scoring, result previews, sharded dialogue context, bounded retries.",
-      "version": "0.3.0-local.19",
+      "version": "0.3.0-local.20",
       "license": "MIT"
     }
   ]

@@ -1,15 +1,38 @@
 # Durable context — fast-jev-compaction-local
 
-Обновлено: 12.10.2026.
+Обновлено: 18.10.2026 (статус TZ-705; история ниже не менялась).
 
 ## Идентичность
 
 - Upstream: tamaratran/fast-jev-compaction 0.3.0.
 - Local plugin: fast-jev-compaction-local@fast-jev-compaction-local.
 - Upstream установлен отдельно и disabled.
-- Текущий local release: 0.3.0-local.19.
+- Последний закреплённый local release: 0.3.0-local.19; в исходнике подготовлен, но не выпущен candidate 0.3.0-local.20.
 - Единственный рабочий исходник: `C:\MCPs\fast-jev-compaction-local` (свой git с 22.09.2026;
   базовая точка — тег `v0.3.0-local.7`). Local marketplace указывает сюда.
+
+## TZ-705: статус нового patch и пределы доказательств (18.10.2026)
+
+- Существующий tag `v0.3.0-local.19` остаётся последним закреплённым.
+  Владелец-оператор 18.10 разрешил подготовить `0.3.0-local.20` без
+  установки: `package.json`, оба plugin manifests и `LOCAL_BUILD` в
+  `hooks/fast-jev.ts` согласованы как кандидат, без tag/publish и runtime
+  обновления. `package-lock.json` синхронизирован с `.20` после штатного
+  расширения owns; новых зависимостей не добавлено.
+- TZ-703 и TZ-704 тестируют production-hook replay **исключительно
+  синтетически**, включая реальные in-memory pages и отсутствие побочного
+  Claude summary. Они не доказывают отсутствие дублей в отрисовке Desktop
+  или точность строки `saved N tokens`: последняя engine-owned и не может
+  исправляться кодом плагина. Desktop-only дубль с корректным model input
+  требует отдельного external bug report с версиями, UTC и actual/expected.
+- Release gate = совместимая bundled Claude Code CLI:
+  `claude plugin validate .claude-plugin/plugin.json` с собственным `rc=0`,
+  а затем проверенный SHA-256 source ↔ installed cache fingerprint и
+  разрешённый владельцем clean-start/canary. В TZ-705 **ничего из этого не
+  выполняется автоматически**; до этих доказательств
+  `BLOCKED / RELEASE_NOT_RUN / GUI_NOT_RUN`. Операторский сценарий и
+  forward-patch rollback — `OPERATIONS.md`, без удаления history/pages и
+  без выключения guard на built-in compaction.
 
 ## Зачем fork
 

@@ -1,0 +1,4 @@
+claude plugin validate .claude-plugin/plugin.json — Claude Code 2.1.278 (Claude Code), 2026-10-19T09:27:32+03:00
+rc=0 (2 warnings: author missing; CLAUDE.md at root not loaded as plugin context)
+npm run typecheck rc=0; npm test 9 files / 128 tests passed
+hooks/fast-jev.ts vs 42273f0: only LOCAL_BUILD .19 -> .20

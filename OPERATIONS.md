@@ -77,6 +77,76 @@ marketplace перепривязан (резервные копии обоих �
 3. `.claude-plugin/marketplace.json`
 4. `hooks/fast-jev.ts` → `LOCAL_BUILD`
 
+### TZ-705: кандидат local.20 и непройденный release gate (18.10.2026)
+
+Это **инструкция оператору**, не подтверждение установки на машине владельца.
+Git tag `v0.3.0-local.19` — предыдущая закреплённая версия.
+Решением владельца-оператора 18.10 разрешён новый **исходный кандидат**
+`0.3.0-local.20`: `package.json`, `.claude-plugin/plugin.json`,
+`.claude-plugin/marketplace.json` и `LOCAL_BUILD` согласованы на `.20`.
+Никакой tag/publish, установки, замены cache или запуска GUI этим не совершено.
+В частности, установленный runtime может по-прежнему сообщать `.19`.
+Lockfile `package-lock.json` также синхронизирован с `.20` в расширенной
+штатным запросом зоне; зависимости не менялись. Остальные release gates ниже
+по-прежнему обязательны.
+
+1. На чистом рабочем экземпляре из
+   `C:\MCPs\fast-jev-compaction-local` зафиксировать последний хороший
+   immutable Git tag/commit `v0.3.0-local.19`; не очищать общий dirty tree,
+   не копировать личный installed cache и не использовать `git reset --hard`.
+   Запустить `npm ci`, `npm run typecheck`, **полный** `npm test` и
+   `npm test -- tests/ui-boundary.test.ts`. Синтетическая TZ-704 фикстура
+   вызывает настоящий `session.compact` дважды с mock HTTP и
+   in-memory страницами, а не личный Desktop/чат.
+2. Для candidate `0.3.0-local.20` изменение `LOCAL_BUILD` уже разрешено
+   владельцем 18.10 и подготовлено вместе с тремя manifests. Перед выпуском
+   проверить четыре строки программно; отсутствие совпадения означает
+   `BLOCKED`, не publish. Новый pin/tag не должен переиспользовать `.19`.
+   `package-lock.json` согласован на `.20` после официального расширения
+   owns TZ-705; проверить совпадение обоих version entries при preflight.
+3. **Внешний обязательный gate до deploy:** оператор берёт реально
+   подходящий **bundled Claude Code >=2.1.274**, проверяет версию и выполняет
+   `claude plugin validate .claude-plugin/plugin.json`, записывает время,
+   exact версию бинарника, `rc=0` и очищенную квитанцию. Известная старая
+   PATH-версия 2.1.212 недостаточна. При `rc!=0`, неизвестной bundled
+   версии или отсутствии квитанции: **`release_not_run`**, независимо от
+   зелёного `npm test`.
+4. До update авторизованный оператор записывает безопасные fingerprint
+   **только файла hook/source** на проверенной pinned версии и установленной
+   версии. Сравнивать SHA-256 фактических байтов
+   `hooks/fast-jev.ts` из signed/pinned source с тем же относительным файлом
+   установленного versioned plugin cache; отсутствие, расхождение или
+   несколько активных build markers → `BLOCKED`. Не печатать содержимое
+   пользовательских страниц/чата, ключи, credentials или настройки. Данный
+   этап **не выполнялся** в TZ-705.
+5. **Только после** независимой приёмки, owner-authorized rollout и release
+   gate: `claude plugin marketplace update fast-jev-compaction-local`,
+   затем `claude plugin update
+   fast-jev-compaction-local@fast-jev-compaction-local`. Не менять
+   `~/.claude/settings.json`, `pluginSecrets`, existing sessions и
+   `~/.claude/plugins/cache` вручную; убедиться, что защита
+   `DISABLE_AUTO_COMPACT=1` и `PreCompact` guard остались включены.
+6. Открыть **новую** Code-сессию/runtime, не перезапускать Desktop. По toast
+   `fast-jev <LOCAL_BUILD> [manual]` и установленному fingerprint проверить
+   действительно загруженный новый marker: `/reload-plugins` не является
+   достаточным доказательством. В **отдельной безопасной synthetic** сессии
+   no-op `/compact` должен дать `skip`, не Claude summary; затем два
+   synthetic replay из TZ-704 и first request after compact. Реальный
+   Desktop UI, живые токены и пост-компакционные наблюдения без разрешения
+   обозначать **`NOT_RUN`**, а не успех.
+
+**Roll-back без reuse version:** при ошибке прекратить rollout, сохранить
+очищенные факты и ссылающийся на исходник pin/tag `v0.3.0-local.19`.
+В изолированном рабочем экземпляре оператор выполняет `git revert`
+проблемного коммита (либо восстанавливает код из закреплённого предыдущего
+tag), **не переписывая общий dirty tree**, выпускает новый forward patch
+`0.3.0-local.21` с согласованными четырьмя версиями, прогоняет весь
+typecheck/Vitest/bundled `plugin validate`/fingerprint gate и только потом
+обычный marketplace/plugin update. Свидетельство smoke в новом Code runtime
+нужно повторить. Старые session journal и pages не удалять; built-in
+compaction protection не выключать. До полного gate статус остаётся
+**`BLOCKED / RELEASE_NOT_RUN / UI_NOT_RUN`**.
+
 Порядок:
 
 1. Изменить код и тесты.
